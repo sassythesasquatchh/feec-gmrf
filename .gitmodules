@@ -1,0 +1,6 @@
+[submodule "gmrf"]
+	path = gmrf
+	url = https://github.com/sassythesasquatchh/gmrf.git
+[submodule "formoniq"]
+	path = formoniq
+	url = https://github.com/sassythesasquatchh/formoniq.git

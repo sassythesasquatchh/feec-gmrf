@@ -1,0 +1,13 @@
+/target/
+/out/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.bak
+
+# OS
+.DS_Store

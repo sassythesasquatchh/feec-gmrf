@@ -2,9 +2,20 @@
 
 This repository is the **integration layer** between an existing FEEC library and an existing GMRF library. The initial implementation will use the **explicit sparse-matrix route** (assemble Jacobians / Hessians and solve via sparse linear algebra).
 
+**Actual repo structure today (important):**
+
+- `feec/` — git submodule containing the FEEC library workspace.
+- `gmrf/` — git submodule containing the GMRF library workspace.
+- `crates/` — integration crates that live in this repo (currently `crates/feg-infer`).
+- `Cargo.toml` — top-level workspace for the integration crates only (it does **not** include the submodules’ workspaces).
+
+Agents should treat `feec/` and `gmrf/` as external submodules and avoid modifying them unless explicitly requested.
+
 This document defines the recommended **multi-repo structure**, crate boundaries, and dependency rules so development stays acyclic and each library keeps a clear responsibility.
 
----
+## Running Commands
+
+When requesting to run commands, always ask to run in release mode unless you have a good reason not to.
 
 ## 1) Repositories and responsibilities
 
@@ -247,3 +258,11 @@ When adding a new feature, first decide which category it is:
 - **Shared traits/types required by both sides** → `feg-core` (keep minimal)
 
 If a change would introduce a cyclic dependency, refactor by moving the shared interface into `feg-core`.
+
+---
+
+## 9) Testing policy (required)
+
+- **Unit tests must be added for all new features.**
+- **Unit tests must be run before signing off on a new feature**, even if the user does not explicitly ask to run tests.
+- **Integration tests must be added and run** when creating new integrations (e.g., between `feec` and `gmrf`).

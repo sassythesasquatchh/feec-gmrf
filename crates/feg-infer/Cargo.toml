@@ -1,0 +1,17 @@
+[package]
+name = "feg-infer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+formoniq = { path = "../../feec/crates/formoniq" }
+manifold = { path = "../../feec/crates/manifold" }
+common = { path = "../../feec/crates/common" }
+exterior = { path = "../../feec/crates/exterior" }
+ddf = { path = "../../feec/crates/ddf" }
+gmrf-core = { path = "../../gmrf/crates/gmrf-core" }
+rand = "0.8"
+feg-gp = { path = "../feg-gp" }
+faer = { workspace = true }
+rand_distr = { workspace = true }
+libm = "0.2"

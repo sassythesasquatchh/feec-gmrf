@@ -1,0 +1,3 @@
+[env]
+# Ensure the PETSc helper binaries are discovered without per-run env setup.
+PETSC_SOLVER_PATH = "feec/petsc-solver"

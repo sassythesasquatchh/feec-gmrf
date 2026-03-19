@@ -1,0 +1,18 @@
+[package]
+name = "feg-gp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+faer = { workspace = true }
+thiserror = { workspace = true }
+formoniq = { path = "../../feec/crates/formoniq" }
+manifold = { path = "../../feec/crates/manifold" }
+exterior = { path = "../../feec/crates/exterior" }
+common = { path = "../../feec/crates/common" }
+libm = "0.2"
+
+[dev-dependencies]
+ddf = { path = "../../feec/crates/ddf" }
+rand = { workspace = true }
+rand_distr = { workspace = true }

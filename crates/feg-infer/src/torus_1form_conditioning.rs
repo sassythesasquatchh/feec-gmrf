@@ -14,7 +14,7 @@ use crate::vtk::{
 use common::linalg::nalgebra::{CsrMatrix as FeecCsr, Matrix as FeecMatrix, Vector as FeecVector};
 use ddf::cochain::{cochain_projection, Cochain};
 use ddf::whitney::lsf::WhitneyLsf;
-use exterior::field::{DiffFormClosure, ExteriorField};
+use exterior::field::{EmbeddedDiffFormClosure, ExteriorField};
 use faer::linalg::solvers::Solve;
 use faer::Side;
 use formoniq::io::{sample_1form_cell_vectors, write_top_cell_vtk_fields};
@@ -1794,7 +1794,7 @@ fn build_local_seed_cochain(
     major_radius: f64,
     minor_radius: f64,
 ) -> Cochain {
-    let seed = DiffFormClosure::one_form(
+    let seed = EmbeddedDiffFormClosure::ambient_one_form(
         move |p| {
             let x = p[0];
             let y = p[1];
@@ -1813,6 +1813,7 @@ fn build_local_seed_cochain(
                 a * toroidal[2] + b * poloidal[2],
             ])
         },
+        coords.dim(),
         topology.dim(),
     );
     cochain_projection(&seed, topology, coords, None)

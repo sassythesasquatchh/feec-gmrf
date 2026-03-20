@@ -8,7 +8,7 @@ use crate::matern_1form::{
 };
 use crate::sparse::feec_csr_to_gmrf;
 use common::linalg::nalgebra::{CsrMatrix as FeecCsr, Matrix as FeecMatrix, Vector as FeecVector};
-use exterior::field::DiffFormClosure;
+use exterior::field::EmbeddedDiffFormClosure;
 use formoniq::{assemble::assemble_galvec, operators::SourceElVec};
 use gmrf_core::{
     types::{DenseMatrix as GmrfDenseMatrix, Vector as GmrfVector},
@@ -392,16 +392,17 @@ pub fn build_analytic_torus_harmonic_basis(
     metric: &MeshLengths,
 ) -> Result<FeecMatrix, String> {
     let (major_radius, minor_radius) = infer_torus_radii(coords)?;
-    let toroidal = DiffFormClosure::one_form(
+    let toroidal = EmbeddedDiffFormClosure::ambient_one_form(
         |p| {
             let x = p[0];
             let y = p[1];
             let rho = (x * x + y * y).sqrt().max(EPS);
             FeecVector::from_column_slice(&[-y / (rho * rho), x / (rho * rho), 0.0])
         },
+        coords.dim(),
         topology.dim(),
     );
-    let poloidal = DiffFormClosure::one_form(
+    let poloidal = EmbeddedDiffFormClosure::ambient_one_form(
         move |p| {
             let x = p[0];
             let y = p[1];
@@ -413,6 +414,7 @@ pub fn build_analytic_torus_harmonic_basis(
                 (rho - major_radius) / (minor_radius * rho),
             ])
         },
+        coords.dim(),
         topology.dim(),
     );
 

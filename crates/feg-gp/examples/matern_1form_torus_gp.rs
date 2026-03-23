@@ -1,19 +1,17 @@
-use common::linalg::nalgebra::Vector as FeecVector;
-use ddf::cochain::Cochain;
-use exterior::field::DiffFormClosure;
-use feg_gp::{condition_full_covariance, SpectralMaternConfig, SpectralMaternGp};
-use formoniq::assemble::assemble_galvec;
+use common::linalg::nalgebra::{bilinear_form_sparse, CooMatrix, CsrMatrix, Vector as NaVector};
+use ddf::{cochain::Cochain, ManifoldComplexExt};
+use feg_gp::{
+    HodgeBranchKind, HodgeBuildOptions, HodgeCompositionalConfig, HodgeCompositionalGp,
+    HodgeDecomposedBasis,
+};
 use formoniq::io::{write_1form_vector_field_vtk, write_cochain_vtk};
-use formoniq::operators::SourceElVec;
-use formoniq::problems::hodge_laplace;
 use manifold::io::gmsh::gmsh2coord_complex;
-use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
-use rand::SeedableRng;
-use rand_distr::{Distribution, StandardNormal};
-use std::fs;
-use std::path::PathBuf;
-use std::time::Instant;
+use std::{
+    fs::{self, File},
+    io::{BufWriter, Write},
+    path::PathBuf,
+    time::Instant,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !petsc_solver_available() {
@@ -22,239 +20,331 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let total_start = Instant::now();
-    let out_dir = "out/matern_1form_torus_gp";
-    let _ = fs::remove_dir_all(out_dir);
-    fs::create_dir_all(out_dir)?;
+    let out_dir = PathBuf::from("out/matern_1form_torus_gp");
+    let _ = fs::remove_dir_all(&out_dir);
+    fs::create_dir_all(&out_dir)?;
 
-    let mesh_path = "meshes/torus_shell.msh";
-    let t = Instant::now();
-    let mesh_bytes = fs::read(mesh_path)?;
+    let mesh_bytes = fs::read("meshes/torus_shell_resolution_1.msh")?;
     let (topology, coords) = gmsh2coord_complex(&mesh_bytes);
     let metric = coords.to_edge_lengths(&topology);
-    println!("mesh load + metric: {:.3}s", t.elapsed().as_secs_f64());
 
-    let grade = 1;
-    let homology_dim = 2;
+    let mut build_options = HodgeBuildOptions::new(2);
+    build_options.exact_mode_count = 12;
+    build_options.coexact_mode_count = 12;
+    let basis = HodgeDecomposedBasis::build(&topology, &metric, 1, build_options)?;
 
-    let t = Instant::now();
-    let source_form = DiffFormClosure::one_form(
-        |p| {
-            let x = p[0];
-            let y = p[1];
-            let rho = (x * x + y * y).sqrt().max(1e-12);
-            FeecVector::from_column_slice(&[-y / rho, x / rho, 0.0])
-        },
-        topology.dim(),
-    );
-    let galmats = hodge_laplace::MixedGalmats::compute(&topology, &metric, grade);
-    let source_data = assemble_galvec(
-        &topology,
-        &metric,
-        SourceElVec::new(&source_form, &coords, None),
-    );
-    println!(
-        "assembly (galmats + source): {:.3}s",
-        t.elapsed().as_secs_f64()
-    );
+    let truth_reduced = build_truth(&basis)?;
+    let observation_indices = observation_indices(basis.ambient_dimension(), 12);
+    let observation_matrix = selector_matrix(basis.ambient_dimension(), &observation_indices);
+    let observations = (&observation_matrix * &truth_reduced)
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
 
-    let t = Instant::now();
-    let gp = SpectralMaternGp::from_hodge_laplace(
-        &topology,
-        &metric,
-        grade,
-        SpectralMaternConfig {
-            kappa: 2.0,
-            alpha: 2.0,
-            tau: 1.0,
-            k: 64,
-        },
+    let mut config = HodgeCompositionalConfig::default();
+    config.exact.mode_count = 12;
+    config.coexact.mode_count = 12;
+    config.harmonic.mode_count = 2;
+    config.exact.kappa = 4.0;
+    config.coexact.kappa = 4.0;
+    config.harmonic.kappa = 4.0;
+    let gp = HodgeCompositionalGp::from_hodge_decomposition(basis.clone(), config)?;
+
+    let exact = gp.condition_branch_linear_observations(
+        HodgeBranchKind::Exact,
+        &observation_matrix,
+        &observations,
+        1e-9,
     )?;
-    println!("spectral GP build: {:.3}s", t.elapsed().as_secs_f64());
+    let coexact = gp.condition_branch_linear_observations(
+        HodgeBranchKind::Coexact,
+        &observation_matrix,
+        &observations,
+        1e-9,
+    )?;
+    let harmonic = gp.condition_branch_linear_observations(
+        HodgeBranchKind::Harmonic,
+        &observation_matrix,
+        &observations,
+        1e-9,
+    )?;
+    let combined = gp.condition_linear_observations(&observation_matrix, &observations, 1e-9)?;
 
-    let t = Instant::now();
-    let (_sigma, u, _harmonics) = hodge_laplace::solve_hodge_laplace_source_with_galmats(
-        &topology,
-        &galmats,
-        source_data,
-        grade,
-        homology_dim,
-    );
-    println!(
-        "FEEC solve (hodge laplace): {:.3}s",
-        t.elapsed().as_secs_f64()
-    );
-
-    let t = Instant::now();
-    let cov = gp.covariance_matrix();
-    println!(
-        "explicit covariance build: {:.3}s",
-        t.elapsed().as_secs_f64()
-    );
-
-    let ndofs = cov.nrows();
-    let t = Instant::now();
-    let prior_variance: Vec<f64> = (0..ndofs).map(|i| cov[(i, i)].max(0.0)).collect();
-    let prior_std: Vec<f64> = prior_variance.iter().map(|v| v.sqrt()).collect();
-
-    let mut prior_rng = StdRng::seed_from_u64(5);
-    let normal = StandardNormal;
-    let mut z = vec![0.0; gp.k()];
-    for zi in &mut z {
-        *zi = normal.sample(&mut prior_rng);
-    }
-    let prior_sample = gp.sample_from_standard_normal(&z)?;
-    println!("prior sample + std: {:.3}s", t.elapsed().as_secs_f64());
-
-    let prior_sample_vec = FeecVector::from_vec(prior_sample);
-    let prior_sample_cochain = Cochain::new(grade, prior_sample_vec);
-    write_cochain_vtk(
-        format!("{out_dir}/prior_sample.vtk"),
+    let truth_full = basis.reduced_layout().lift_vector(&truth_reduced)?;
+    write_field(&coords, &topology, &out_dir.join("truth"), &truth_full)?;
+    write_branch_outputs(
         &coords,
         &topology,
-        &prior_sample_cochain,
-        "prior_sample",
+        &basis,
+        &out_dir.join("exact"),
+        HodgeBranchKind::Exact,
+        &exact.mean,
+        &exact.variance,
     )?;
-    write_1form_vector_field_vtk(
-        format!("{out_dir}/prior_sample_vector_field.vtk"),
+    write_branch_outputs(
         &coords,
         &topology,
-        &prior_sample_cochain,
-        "prior_sample_vector_field",
+        &basis,
+        &out_dir.join("coexact"),
+        HodgeBranchKind::Coexact,
+        &coexact.mean,
+        &coexact.variance,
     )?;
-
-    let prior_variance_vec = FeecVector::from_vec(prior_variance);
-    let prior_variance_cochain = Cochain::new(grade, prior_variance_vec);
-    write_cochain_vtk(
-        format!("{out_dir}/prior_variance.vtk"),
+    write_branch_outputs(
         &coords,
         &topology,
-        &prior_variance_cochain,
-        "prior_variance",
+        &basis,
+        &out_dir.join("harmonic"),
+        HodgeBranchKind::Harmonic,
+        &harmonic.mean,
+        &harmonic.variance,
     )?;
-
-    let prior_std_vec = FeecVector::from_vec(prior_std);
-    let prior_std_cochain = Cochain::new(grade, prior_std_vec);
-    write_cochain_vtk(
-        format!("{out_dir}/prior_std.vtk"),
+    write_branch_outputs(
         &coords,
         &topology,
-        &prior_std_cochain,
-        "prior_std",
+        &basis,
+        &out_dir.join("combined"),
+        HodgeBranchKind::Harmonic,
+        &combined.mean,
+        &combined.variance,
     )?;
-
-    let u_vals: Vec<f64> = u.coeffs.iter().copied().collect();
-
-    let obs_fraction = 0.10;
-    let mut num_obs = (ndofs as f64 * obs_fraction).round() as usize;
-    num_obs = num_obs.clamp(1, ndofs);
-    let mut obs_indices: Vec<usize> = (0..ndofs).collect();
-    let mut obs_rng = StdRng::seed_from_u64(11);
-    obs_indices.shuffle(&mut obs_rng);
-    obs_indices.truncate(num_obs);
-    obs_indices.sort_unstable();
-
-    let t = Instant::now();
-    let obs_values: Vec<f64> = obs_indices.iter().map(|&idx| u_vals[idx]).collect();
-    let noise_variance = 1e-9;
-    let conditioned = condition_full_covariance(&cov, &obs_indices, &obs_values, noise_variance)?;
-    let (max_abs_err, mean_abs_err) = obs_indices.iter().zip(obs_values.iter()).fold(
-        (0.0_f64, 0.0_f64),
-        |(max_err, sum_err), (&idx, &obs)| {
-            let err = (conditioned.mean[idx] - obs).abs();
-            (max_err.max(err), sum_err + err)
-        },
-    );
-    let mean_abs_err = mean_abs_err / num_obs as f64;
-    let obs_tol = if noise_variance == 0.0 {
-        1e-10
-    } else {
-        noise_variance.sqrt() * 0.5
-    };
-    if max_abs_err > obs_tol {
-        return Err(format!(
-            "posterior mean mismatch at observations: max abs error {max_abs_err:.3e} \
-             (mean {mean_abs_err:.3e}) exceeds tolerance {obs_tol:.3e}"
-        )
-        .into());
-    }
-    let posterior_std: Vec<f64> = conditioned.variance.iter().map(|v| v.sqrt()).collect();
-    println!("GP conditioning: {:.3}s", t.elapsed().as_secs_f64());
-
-    let t = Instant::now();
-    write_cochain_vtk(
-        format!("{out_dir}/solution.vtk"),
+    write_observation_mask(
         &coords,
         &topology,
-        &u,
-        "solution",
+        &out_dir.join("observation_mask.vtk"),
+        basis.ambient_dimension(),
+        &observation_indices,
     )?;
-    write_1form_vector_field_vtk(
-        format!("{out_dir}/solution_vector_field.vtk"),
-        &coords,
+    write_summary(
+        &out_dir.join("summary.txt"),
         &topology,
-        &u,
-        "solution_vector_field",
+        &basis,
+        &observation_matrix,
+        &observations,
+        &exact.mean,
+        &coexact.mean,
+        &harmonic.mean,
+        &combined.mean,
     )?;
 
-    let posterior_mean_vec = FeecVector::from_vec(conditioned.mean);
-    let posterior_mean_cochain = Cochain::new(grade, posterior_mean_vec);
-    write_cochain_vtk(
-        format!("{out_dir}/posterior_mean.vtk"),
-        &coords,
-        &topology,
-        &posterior_mean_cochain,
-        "posterior_mean",
-    )?;
-    write_1form_vector_field_vtk(
-        format!("{out_dir}/posterior_mean_vector_field.vtk"),
-        &coords,
-        &topology,
-        &posterior_mean_cochain,
-        "posterior_mean_vector_field",
-    )?;
-
-    let posterior_std_vec = FeecVector::from_vec(posterior_std);
-    let posterior_std_cochain = Cochain::new(grade, posterior_std_vec);
-    write_cochain_vtk(
-        format!("{out_dir}/posterior_std.vtk"),
-        &coords,
-        &topology,
-        &posterior_std_cochain,
-        "posterior_std",
-    )?;
-
-    let mut obs_mask = vec![0.0; ndofs];
-    for &idx in &obs_indices {
-        obs_mask[idx] = 1.0;
-    }
-    let obs_mask_cochain = Cochain::new(grade, FeecVector::from_vec(obs_mask));
-    write_cochain_vtk(
-        format!("{out_dir}/observation_mask.vtk"),
-        &coords,
-        &topology,
-        &obs_mask_cochain,
-        "observation_mask",
-    )?;
-
-    println!("write VTK outputs: {:.3}s", t.elapsed().as_secs_f64());
-    println!("1-form dofs: {ndofs}");
-    println!(
-        "observations: {num_obs} of {ndofs} (~{:.1}%)",
-        100.0 * num_obs as f64 / ndofs as f64
-    );
-    println!("Loaded mesh from {mesh_path}");
-    println!("Wrote VTK outputs to {out_dir}");
+    println!("Wrote outputs to {}", out_dir.display());
     println!("total runtime: {:.3}s", total_start.elapsed().as_secs_f64());
-
     Ok(())
+}
+
+fn build_truth(basis: &HodgeDecomposedBasis) -> Result<NaVector, String> {
+    let exact = basis.branch_basis(HodgeBranchKind::Exact);
+    let coexact = basis.branch_basis(HodgeBranchKind::Coexact);
+    let harmonic = basis.branch_basis(HodgeBranchKind::Harmonic);
+    if exact.len() == 0 || coexact.len() == 0 || harmonic.len() < 2 {
+        return Err(
+            "torus example requires non-empty exact, coexact, and two harmonic modes".into(),
+        );
+    }
+
+    Ok(column(exact.eigenvectors(), 0).scale(0.8)
+        + column(coexact.eigenvectors(), 0).scale(-0.6)
+        + column(harmonic.eigenvectors(), 0).scale(0.75)
+        + column(harmonic.eigenvectors(), 1).scale(-0.5))
+}
+
+fn selector_matrix(dimension: usize, indices: &[usize]) -> CsrMatrix {
+    let mut selector = CooMatrix::new(indices.len(), dimension);
+    for (row, &index) in indices.iter().enumerate() {
+        selector.push(row, index, 1.0);
+    }
+    CsrMatrix::from(&selector)
+}
+
+fn observation_indices(dimension: usize, count: usize) -> Vec<usize> {
+    let step = (dimension / count.max(1)).max(1);
+    (0..dimension).step_by(step).take(count).collect()
+}
+
+fn column(matrix: &faer::Mat<f64>, index: usize) -> NaVector {
+    NaVector::from_iterator(
+        matrix.nrows(),
+        (0..matrix.nrows()).map(|row| matrix[(row, index)]),
+    )
+}
+
+fn write_field(
+    coords: &manifold::geometry::coord::mesh::MeshCoords,
+    topology: &manifold::topology::complex::Complex,
+    path_prefix: &std::path::Path,
+    values: &NaVector,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cochain = Cochain::new(1, values.clone());
+    write_cochain_vtk(
+        path_prefix.with_extension("vtk"),
+        coords,
+        topology,
+        &cochain,
+        "field",
+    )?;
+    write_1form_vector_field_vtk(
+        path_prefix.with_file_name(format!(
+            "{}_vector_field.vtk",
+            path_prefix.file_name().unwrap().to_string_lossy()
+        )),
+        coords,
+        topology,
+        &cochain,
+        "field_vector",
+    )?;
+    Ok(())
+}
+
+fn write_branch_outputs(
+    coords: &manifold::geometry::coord::mesh::MeshCoords,
+    topology: &manifold::topology::complex::Complex,
+    basis: &HodgeDecomposedBasis,
+    branch_dir: &std::path::Path,
+    _kind: HodgeBranchKind,
+    reduced_mean: &[f64],
+    reduced_variance: &[f64],
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(branch_dir)?;
+    let lifted_mean = basis
+        .reduced_layout()
+        .lift_vector(&NaVector::from_vec(reduced_mean.to_vec()))?;
+    let lifted_variance = basis
+        .reduced_layout()
+        .lift_vector(&NaVector::from_vec(reduced_variance.to_vec()))?;
+    write_field(
+        coords,
+        topology,
+        &branch_dir.join("posterior_mean"),
+        &lifted_mean,
+    )?;
+    let variance_cochain = Cochain::new(1, lifted_variance);
+    write_cochain_vtk(
+        branch_dir.join("posterior_variance.vtk"),
+        coords,
+        topology,
+        &variance_cochain,
+        "posterior_variance",
+    )?;
+    Ok(())
+}
+
+fn write_observation_mask(
+    coords: &manifold::geometry::coord::mesh::MeshCoords,
+    topology: &manifold::topology::complex::Complex,
+    path: &std::path::Path,
+    dimension: usize,
+    indices: &[usize],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut mask = NaVector::zeros(dimension);
+    for &index in indices {
+        mask[index] = 1.0;
+    }
+    let cochain = Cochain::new(1, mask);
+    write_cochain_vtk(path, coords, topology, &cochain, "observation_mask")?;
+    Ok(())
+}
+
+fn write_summary(
+    path: &std::path::Path,
+    topology: &manifold::topology::complex::Complex,
+    basis: &HodgeDecomposedBasis,
+    observation_matrix: &CsrMatrix,
+    observations: &[f64],
+    exact_mean: &[f64],
+    coexact_mean: &[f64],
+    harmonic_mean: &[f64],
+    combined_mean: &[f64],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    writeln!(writer, "ambient_dimension={}", basis.ambient_dimension())?;
+    writeln!(
+        writer,
+        "exact_modes={} coexact_modes={} harmonic_modes={}",
+        basis.branch_basis(HodgeBranchKind::Exact).len(),
+        basis.branch_basis(HodgeBranchKind::Coexact).len(),
+        basis.branch_basis(HodgeBranchKind::Harmonic).len(),
+    )?;
+    writeln!(
+        writer,
+        "exact_curl_relative={}",
+        relative_curl_residual(topology, exact_mean)
+    )?;
+    writeln!(
+        writer,
+        "coexact_coclosed_relative={}",
+        relative_coclosed_residual(topology, basis.reduced_mass(), coexact_mean)
+    )?;
+    writeln!(
+        writer,
+        "harmonic_projection_error={}",
+        harmonic_projection_error(
+            basis.branch_basis(HodgeBranchKind::Harmonic),
+            basis.reduced_mass(),
+            harmonic_mean,
+        )
+    )?;
+    writeln!(
+        writer,
+        "combined_observation_residual={}",
+        observation_residual_norm(observation_matrix, observations, combined_mean)
+    )?;
+    Ok(())
+}
+
+fn relative_curl_residual(topology: &manifold::topology::complex::Complex, mean: &[f64]) -> f64 {
+    let mean = NaVector::from_vec(mean.to_vec());
+    let d1 = CsrMatrix::from(&topology.exterior_derivative_operator(1));
+    let residual = &d1 * &mean;
+    residual.norm() / mean.norm().max(1e-12)
+}
+
+fn relative_coclosed_residual(
+    topology: &manifold::topology::complex::Complex,
+    mass: &CsrMatrix,
+    mean: &[f64],
+) -> f64 {
+    let mean = NaVector::from_vec(mean.to_vec());
+    let d0 = CsrMatrix::from(&topology.exterior_derivative_operator(0));
+    let weighted = mass * &mean;
+    let residual = d0.transpose() * weighted;
+    residual.norm() / mean.norm().max(1e-12)
+}
+
+fn harmonic_projection_error(
+    branch: &feg_gp::HodgeBranchBasis,
+    mass: &CsrMatrix,
+    mean: &[f64],
+) -> f64 {
+    let mean = NaVector::from_vec(mean.to_vec());
+    let mut reconstructed = NaVector::zeros(mean.len());
+    for col in 0..branch.len() {
+        let basis_vec = column(branch.eigenvectors(), col);
+        let coeff = bilinear_form_sparse(mass, &basis_vec, &mean);
+        reconstructed += basis_vec.scale(coeff);
+    }
+    let norm = mean.norm().max(1e-12);
+    (&reconstructed - mean).norm() / norm
+}
+
+fn observation_residual_norm(
+    observation_matrix: &CsrMatrix,
+    observations: &[f64],
+    mean: &[f64],
+) -> f64 {
+    let predicted = observation_matrix * NaVector::from_vec(mean.to_vec());
+    (predicted - NaVector::from_vec(observations.to_vec())).norm()
 }
 
 fn petsc_solver_available() -> bool {
     if let Ok(path) = std::env::var("PETSC_SOLVER_PATH") {
-        let candidate = PathBuf::from(path).join("ghiep.out");
-        return candidate.exists();
+        if !path.is_empty() {
+            let candidate = PathBuf::from(path).join("ghiep.out");
+            return candidate.exists();
+        }
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../feec/petsc-solver/ghiep.out")
-        .exists()
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .ancestors()
+        .map(|ancestor| ancestor.join("feec/petsc-solver/ghiep.out"))
+        .any(|candidate| candidate.exists())
 }

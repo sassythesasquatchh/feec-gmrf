@@ -475,7 +475,6 @@ impl SparseRowLinearOperator {
         Ok(Self { ncols, rows })
     }
 
-    #[cfg(test)]
     fn identity(size: usize) -> Self {
         Self {
             ncols: size,
@@ -3143,7 +3142,9 @@ fn write_branch_surface_vector_vtk(
     branch: &Torus1FormBranchResult,
     branch_dir: &Path,
 ) -> Result<(), Box<dyn Error>> {
+    let truth = Cochain::new(1, branch.truth.clone());
     let posterior_mean = Cochain::new(1, branch.posterior_mean.clone());
+    let truth_vectors = sample_1form_cell_vectors(&result.coords, &result.topology, &truth)?;
     let posterior_mean_vectors =
         sample_1form_cell_vectors(&result.coords, &result.topology, &posterior_mean)?;
     let posterior_mean_magnitude = vector_magnitudes(&posterior_mean_vectors);
@@ -3157,6 +3158,7 @@ fn write_branch_surface_vector_vtk(
         &result.coords,
         &result.topology,
         &[
+            ("truth_surface_vector", truth_vectors.as_slice()),
             (
                 "posterior_mean_surface_vector",
                 posterior_mean_vectors.as_slice(),
@@ -4197,6 +4199,875 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormConditioningKappa0Config {
+    pub mesh_path: PathBuf,
+    pub tau: f64,
+    pub noise_variance: f64,
+    pub surface_vector_variance_mode: SurfaceVectorVarianceMode,
+    pub num_rbmc_probes: usize,
+    pub rbmc_batch_count: usize,
+    pub rng_seed: u64,
+    pub observation_targets: Vec<Torus1FormObservationTarget>,
+}
+
+impl Default for Torus1FormConditioningKappa0Config {
+    fn default() -> Self {
+        Self {
+            mesh_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../meshes/torus_shell.msh"),
+            tau: 1.0,
+            noise_variance: 1e-8,
+            surface_vector_variance_mode: SurfaceVectorVarianceMode::RbmcClipped,
+            num_rbmc_probes: DEFAULT_NUM_RBMC_PROBES,
+            rbmc_batch_count: DEFAULT_RBMC_BATCH_COUNT,
+            rng_seed: DEFAULT_RNG_SEED,
+            observation_targets: DEFAULT_OBSERVATION_TARGETS.to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormConditioningKappa0VarianceFields {
+    pub reconstructed: Torus1FormVarianceComponentFields,
+    pub surface_vector: Torus1FormAmbientVarianceFields,
+    pub circulation: Torus1FormVarianceFieldSet,
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormConditioningKappa0Result {
+    pub topology: Complex,
+    pub coords: MeshCoords,
+    pub edge_theta: FeecVector,
+    pub edge_phi: FeecVector,
+    pub toroidal_alignment_sq: FeecVector,
+    pub observation_targets: Vec<Torus1FormObservationTarget>,
+    pub selected_observations: Vec<Torus1FormSelectedObservation>,
+    pub observation_indices: Vec<usize>,
+    pub major_radius: f64,
+    pub minor_radius: f64,
+    pub surface_vector_variance_mode: SurfaceVectorVarianceMode,
+    pub num_rbmc_probes: usize,
+    pub rbmc_batch_count: usize,
+    pub rng_seed: u64,
+    pub truth: FeecVector,
+    pub posterior_mean: FeecVector,
+    pub absolute_mean_error: FeecVector,
+    pub prior_variance: FeecVector,
+    pub posterior_variance: FeecVector,
+    pub variance_reduction: FeecVector,
+    pub observed_mask: FeecVector,
+    pub nearest_observation_value: FeecVector,
+    pub nearest_observation_distance: FeecVector,
+    pub observation_values: Vec<f64>,
+    pub observation_summaries: Vec<Torus1FormObservationSummary>,
+    pub harmonic_coefficients_truth: [f64; 2],
+    pub harmonic_coefficients_posterior_mean: [f64; 2],
+    pub observed_summary: ObservedSummary,
+    pub variance_fields: Torus1FormConditioningKappa0VarianceFields,
+}
+
+pub fn run_torus_1form_conditioning_kappa0(
+    config: &Torus1FormConditioningKappa0Config,
+) -> Result<Torus1FormConditioningKappa0Result, Box<dyn Error>> {
+    validate_kappa0_config(config)?;
+
+    let mesh_bytes = fs::read(&config.mesh_path)?;
+    let (topology, coords) = manifold::io::gmsh::gmsh2coord_complex(&mesh_bytes);
+    let metric = coords.to_edge_lengths(&topology);
+    let geometry = build_torus_edge_geometry(&topology, &coords)?;
+    let cell_geometry = build_torus_cell_geometry(
+        &topology,
+        &coords,
+        geometry.major_radius,
+        geometry.minor_radius,
+    )
+    .map_err(invalid_data)?;
+    let hodge = build_hodge_laplacian_1form(&topology, &metric);
+    let harmonic_basis =
+        build_analytic_torus_harmonic_basis(&topology, &coords, &metric).map_err(invalid_data)?;
+    let harmonic_basis_orthonormal =
+        mass_orthonormalize_harmonic_basis(&harmonic_basis, &hodge.mass_u).map_err(invalid_data)?;
+    let harmonic_constraints =
+        build_harmonic_orthogonality_constraints(&harmonic_basis, &hodge.mass_u)
+            .map_err(invalid_data)?;
+
+    let seed = build_local_seed_cochain(
+        &topology,
+        &coords,
+        geometry.major_radius,
+        geometry.minor_radius,
+    );
+    let truth = remove_harmonic_content(&seed.coeffs, &harmonic_basis_orthonormal, &hodge.mass_u);
+
+    let selected_observations =
+        select_observation_edges(&geometry, &config.observation_targets).map_err(invalid_data)?;
+    let observation_indices = selected_observations
+        .iter()
+        .map(|selected| selected.edge_index)
+        .collect::<Vec<_>>();
+    let observation_matrix = observation_selector(hodge.mass_u.nrows(), &observation_indices);
+    let observed_mask = build_observed_mask(hodge.mass_u.nrows(), &observation_indices);
+    let nearest_observation_slots =
+        build_nearest_observation_slots(&geometry, &observation_indices);
+    let nearest_observation_distance = build_nearest_observation_distance_field(
+        &geometry,
+        &observation_indices,
+        &nearest_observation_slots,
+    );
+    let edge_theta = FeecVector::from_vec(geometry.theta.clone());
+    let edge_phi = FeecVector::from_vec(geometry.phi.clone());
+    let toroidal_alignment_sq = FeecVector::from_vec(geometry.toroidal_alignment_sq.clone());
+
+    let prior_precision = build_matern_precision_1form(
+        &topology,
+        &metric,
+        &hodge,
+        MaternConfig {
+            kappa: 0.0,
+            tau: config.tau,
+            mass_inverse: MaternMassInverse::Nc1ProjectedSparseInverse,
+        },
+    );
+    let q_prior = feec_csr_to_gmrf(&prior_precision);
+    let zero_observations = GmrfVector::zeros(observation_indices.len());
+    let (posterior_precision, _) = apply_gaussian_observations(
+        &q_prior,
+        &observation_matrix,
+        &zero_observations,
+        None,
+        config.noise_variance,
+    );
+
+    let toroidal_operator =
+        build_reconstructed_component_operator(&topology, &coords, &cell_geometry, true)
+            .map_err(invalid_data)?;
+    let poloidal_operator =
+        build_reconstructed_component_operator(&topology, &coords, &cell_geometry, false)
+            .map_err(invalid_data)?;
+    let surface_x_operator =
+        build_embedded_component_operator(&topology, &coords, 0).map_err(invalid_data)?;
+    let surface_y_operator =
+        build_embedded_component_operator(&topology, &coords, 1).map_err(invalid_data)?;
+    let surface_z_operator =
+        build_embedded_component_operator(&topology, &coords, 2).map_err(invalid_data)?;
+    let reconstructed_stacked_operator =
+        SparseRowLinearOperator::stack(&[&toroidal_operator, &poloidal_operator])
+            .map_err(invalid_data)?;
+    let surface_vector_stacked_operator = SparseRowLinearOperator::stack(&[
+        &surface_x_operator,
+        &surface_y_operator,
+        &surface_z_operator,
+    ])
+    .map_err(invalid_data)?;
+    let circulation_operator =
+        build_local_circulation_operator(&topology, hodge.mass_u.nrows()).map_err(invalid_data)?;
+
+    let identity_operator = SparseRowLinearOperator::identity(hodge.mass_u.nrows());
+    let prior_solver = crate::torus_1form_kappa0_support::ConstrainedKktSolver::new(
+        &q_prior,
+        &harmonic_constraints,
+    )?;
+    let prior_latent_variances = kappa0_estimates(estimate_kappa0_transformed_rbmc_variances(
+        &prior_solver,
+        &identity_operator,
+        config.num_rbmc_probes,
+        config.rbmc_batch_count,
+        config.rng_seed.wrapping_add(0x0800),
+    )?);
+    let reconstructed_prior = split_component_estimates(
+        kappa0_estimates(estimate_kappa0_transformed_rbmc_variances(
+            &prior_solver,
+            &reconstructed_stacked_operator,
+            config.num_rbmc_probes,
+            config.rbmc_batch_count,
+            config.rng_seed.wrapping_add(0x1000),
+        )?),
+        cell_geometry.theta.len(),
+    )
+    .map_err(invalid_data)?;
+    let surface_vector_prior_estimates = match config.surface_vector_variance_mode {
+        SurfaceVectorVarianceMode::Exact => kappa0_estimates(exact_kappa0_transformed_variances(
+            &prior_solver,
+            &surface_vector_stacked_operator,
+        )?),
+        SurfaceVectorVarianceMode::Rbmc | SurfaceVectorVarianceMode::RbmcClipped => {
+            kappa0_estimates(estimate_kappa0_transformed_rbmc_variances(
+                &prior_solver,
+                &surface_vector_stacked_operator,
+                config.num_rbmc_probes,
+                config.rbmc_batch_count,
+                config.rng_seed.wrapping_add(0x1800),
+            )?)
+        }
+    };
+    let surface_vector_prior =
+        split_ambient_estimates(surface_vector_prior_estimates, cell_geometry.theta.len())
+            .map_err(invalid_data)?;
+    let circulation_prior = kappa0_estimates(estimate_kappa0_transformed_rbmc_variances(
+        &prior_solver,
+        &circulation_operator,
+        config.num_rbmc_probes,
+        config.rbmc_batch_count,
+        config.rng_seed.wrapping_add(0x3000),
+    )?);
+
+    let posterior_solver = crate::torus_1form_kappa0_support::ConstrainedKktSolver::new(
+        &posterior_precision,
+        &harmonic_constraints,
+    )?;
+    let posterior_latent_variances = kappa0_estimates(estimate_kappa0_transformed_rbmc_variances(
+        &posterior_solver,
+        &identity_operator,
+        config.num_rbmc_probes,
+        config.rbmc_batch_count,
+        config.rng_seed.wrapping_add(0x2800),
+    )?);
+    let reconstructed_posterior = split_component_estimates(
+        kappa0_estimates(estimate_kappa0_transformed_rbmc_variances(
+            &posterior_solver,
+            &reconstructed_stacked_operator,
+            config.num_rbmc_probes,
+            config.rbmc_batch_count,
+            config.rng_seed.wrapping_add(0x1000),
+        )?),
+        cell_geometry.theta.len(),
+    )
+    .map_err(invalid_data)?;
+    let surface_vector_posterior_estimates = match config.surface_vector_variance_mode {
+        SurfaceVectorVarianceMode::Exact => kappa0_estimates(exact_kappa0_transformed_variances(
+            &posterior_solver,
+            &surface_vector_stacked_operator,
+        )?),
+        SurfaceVectorVarianceMode::Rbmc | SurfaceVectorVarianceMode::RbmcClipped => {
+            kappa0_estimates(estimate_kappa0_transformed_rbmc_variances(
+                &posterior_solver,
+                &surface_vector_stacked_operator,
+                config.num_rbmc_probes,
+                config.rbmc_batch_count,
+                config.rng_seed.wrapping_add(0x1800),
+            )?)
+        }
+    };
+    let surface_vector_posterior =
+        if config.surface_vector_variance_mode == SurfaceVectorVarianceMode::RbmcClipped {
+            clip_rbmc_posterior_to_prior(
+                &surface_vector_prior,
+                &split_ambient_estimates(
+                    surface_vector_posterior_estimates,
+                    cell_geometry.theta.len(),
+                )
+                .map_err(invalid_data)?,
+            )
+        } else {
+            split_ambient_estimates(
+                surface_vector_posterior_estimates,
+                cell_geometry.theta.len(),
+            )
+            .map_err(invalid_data)?
+        };
+    let circulation_posterior = kappa0_estimates(estimate_kappa0_transformed_rbmc_variances(
+        &posterior_solver,
+        &circulation_operator,
+        config.num_rbmc_probes,
+        config.rbmc_batch_count,
+        config.rng_seed.wrapping_add(0x3000),
+    )?);
+
+    let truth_gmrf = feec_vec_to_gmrf(&truth);
+    let observation_values = (&observation_matrix * &truth_gmrf)
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let information = ht_weighted_observations(
+        &observation_matrix,
+        &GmrfVector::from_vec(observation_values.clone()),
+        1.0 / config.noise_variance,
+    );
+    let posterior_mean = gmrf_vec_to_feec(&posterior_solver.solve_mean(&information)?);
+
+    let prior_variance = gmrf_vec_to_feec(&prior_latent_variances.harmonic_free);
+    let posterior_variance = gmrf_vec_to_feec(&posterior_latent_variances.harmonic_free);
+    let absolute_mean_error = absolute_difference(&posterior_mean, &truth);
+    let variance_reduction = &prior_variance - &posterior_variance;
+    let nearest_observation_value =
+        build_nearest_observation_value_field(&nearest_observation_slots, &observation_values);
+    let harmonic_coefficients_truth =
+        harmonic_coefficients(&truth, &harmonic_basis_orthonormal, &hodge.mass_u)
+            .map_err(invalid_data)?;
+    let harmonic_coefficients_posterior_mean =
+        harmonic_coefficients(&posterior_mean, &harmonic_basis_orthonormal, &hodge.mass_u)
+            .map_err(invalid_data)?;
+    let observation_summaries = build_observation_summaries(
+        &selected_observations,
+        &observation_values,
+        &posterior_mean,
+        &absolute_mean_error,
+        &prior_variance,
+        &posterior_variance,
+        &truth,
+        &posterior_mean,
+        &absolute_mean_error,
+        &prior_variance,
+        &posterior_variance,
+    );
+    let observed_summary = summarize_observed(
+        &selected_observations
+            .iter()
+            .map(|selected| selected.edge_index)
+            .collect::<Vec<_>>(),
+        &absolute_mean_error,
+        &absolute_mean_error,
+        &prior_variance,
+        &posterior_variance,
+        &prior_variance,
+        &posterior_variance,
+    )
+    .map_err(invalid_data)?;
+
+    Ok(Torus1FormConditioningKappa0Result {
+        topology,
+        coords,
+        edge_theta,
+        edge_phi,
+        toroidal_alignment_sq,
+        observation_targets: config.observation_targets.clone(),
+        selected_observations,
+        observation_indices,
+        major_radius: geometry.major_radius,
+        minor_radius: geometry.minor_radius,
+        surface_vector_variance_mode: config.surface_vector_variance_mode,
+        num_rbmc_probes: config.num_rbmc_probes,
+        rbmc_batch_count: config.rbmc_batch_count,
+        rng_seed: config.rng_seed,
+        truth,
+        posterior_mean,
+        absolute_mean_error,
+        prior_variance,
+        posterior_variance,
+        variance_reduction,
+        observed_mask,
+        nearest_observation_value,
+        nearest_observation_distance,
+        observation_values,
+        observation_summaries,
+        harmonic_coefficients_truth,
+        harmonic_coefficients_posterior_mean,
+        observed_summary,
+        variance_fields: Torus1FormConditioningKappa0VarianceFields {
+            reconstructed: build_component_field_set(
+                &reconstructed_prior,
+                &reconstructed_posterior,
+                true,
+            ),
+            surface_vector: build_ambient_field_set(
+                &surface_vector_prior,
+                &surface_vector_posterior,
+                true,
+            ),
+            circulation: build_variance_field_set(&circulation_prior, &circulation_posterior, true),
+        },
+    })
+}
+
+pub fn write_torus_1form_conditioning_kappa0_outputs(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: impl AsRef<Path>,
+) -> Result<(), Box<dyn Error>> {
+    let out_dir = out_dir.as_ref();
+    let _ = fs::remove_dir_all(out_dir);
+    fs::create_dir_all(out_dir)?;
+
+    write_kappa0_selected_observations_csv(result, out_dir)?;
+    write_kappa0_summary(result, out_dir)?;
+    write_kappa0_fields_vtk(result, out_dir)?;
+    write_kappa0_surface_vector_vtk(result, out_dir)?;
+    write_kappa0_edge_csv(result, out_dir)?;
+    write_kappa0_observation_csv(result, out_dir)?;
+    write_kappa0_variance_field_vtks(result, out_dir)?;
+    crate::torus_1form_kappa0_support::write_surface_vector_stats(
+        &result.coords,
+        &result.topology,
+        &result.posterior_mean,
+        &result.truth,
+        &result.variance_fields.surface_vector,
+        out_dir,
+        &out_dir.join("summary.txt"),
+    )?;
+
+    Ok(())
+}
+
+fn validate_kappa0_config(
+    config: &Torus1FormConditioningKappa0Config,
+) -> Result<(), Box<dyn Error>> {
+    if !config.tau.is_finite() || config.tau <= 0.0 {
+        return Err(invalid_input("tau must be finite and positive").into());
+    }
+    if !config.noise_variance.is_finite() || config.noise_variance <= 0.0 {
+        return Err(invalid_input("noise_variance must be finite and positive").into());
+    }
+    if config.num_rbmc_probes == 0 {
+        return Err(invalid_input("num_rbmc_probes must be >= 1").into());
+    }
+    if config.rbmc_batch_count == 0 {
+        return Err(invalid_input("rbmc_batch_count must be >= 1").into());
+    }
+    if config.observation_targets.is_empty() {
+        return Err(invalid_input("at least one observation target is required").into());
+    }
+    Ok(())
+}
+
+fn kappa0_estimates(constrained: GmrfVector) -> RbmcVarianceEstimates {
+    RbmcVarianceEstimates {
+        unconstrained: constrained.clone(),
+        harmonic_free: constrained,
+    }
+}
+
+fn exact_kappa0_transformed_variances(
+    solver: &crate::torus_1form_kappa0_support::ConstrainedKktSolver,
+    operator: &SparseRowLinearOperator,
+) -> Result<GmrfVector, GmrfError> {
+    let mut constrained = GmrfVector::zeros(operator.nrows());
+    for (row_index, row) in operator.rows.iter().enumerate() {
+        let rhs = sparse_row_rhs(row, operator.ncols);
+        let solved = solver.solve_covariance_action(&rhs)?;
+        let value = row
+            .iter()
+            .map(|(state_index, weight)| *weight * solved[*state_index])
+            .sum::<f64>();
+        constrained[row_index] = clamp_small_negative_variance(
+            value,
+            rhs.norm().max(1.0),
+            "transformed constrained marginal variance must be nonnegative",
+        )?;
+    }
+    Ok(constrained)
+}
+
+fn estimate_kappa0_transformed_rbmc_variances(
+    solver: &crate::torus_1form_kappa0_support::ConstrainedKktSolver,
+    operator: &SparseRowLinearOperator,
+    num_rbmc_probes: usize,
+    rbmc_batch_count: usize,
+    rng_seed: u64,
+) -> Result<GmrfVector, Box<dyn Error>> {
+    let batch_sizes = rbmc_batch_sizes(num_rbmc_probes, rbmc_batch_count);
+    let mut batch_estimates = Vec::with_capacity(batch_sizes.len());
+    for (batch_idx, batch_size) in batch_sizes.iter().copied().enumerate() {
+        let batch_seed = rng_seed.wrapping_add(
+            0x9E37_79B9_7F4A_7C15_u64.wrapping_mul((batch_idx as u64).wrapping_add(1)),
+        );
+        let mut rng = rand::rngs::StdRng::seed_from_u64(batch_seed);
+        let batch_raw =
+            kappa0_transformed_rbmc_variances_batch(solver, operator, batch_size, &mut rng)?;
+        let (batch_stabilized, _floor_hits) = stabilize_positive_variances(&batch_raw);
+        batch_estimates.push(batch_stabilized);
+    }
+
+    Ok(weighted_average_vectors(&batch_estimates, &batch_sizes).map_err(invalid_data)?)
+}
+
+fn kappa0_transformed_rbmc_variances_batch(
+    solver: &crate::torus_1form_kappa0_support::ConstrainedKktSolver,
+    operator: &SparseRowLinearOperator,
+    num_samples: usize,
+    rng: &mut rand::rngs::StdRng,
+) -> Result<GmrfVector, GmrfError> {
+    if num_samples == 0 {
+        return Err(GmrfError::DimensionMismatch(
+            "at least one RBMC probe is required",
+        ));
+    }
+
+    let output_dim = operator.nrows();
+    let mut variances = GmrfVector::zeros(output_dim);
+    for _ in 0..num_samples {
+        let probe = GmrfVector::from_fn(output_dim, |_| rng.sample(StandardNormal));
+        let rhs = operator.apply_transpose(&probe);
+        let solved = solver.solve_covariance_action(&rhs)?;
+        let projected = operator.apply(&solved);
+        variances += projected.component_mul(&probe);
+    }
+
+    Ok(variances / num_samples as f64)
+}
+
+fn write_kappa0_selected_observations_csv(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(out_dir.join("selected_observations.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "observation_index,edge_index,direction,target_theta,target_phi,edge_theta,edge_phi,toroidal_alignment_sq,selection_distance,used_fallback"
+    )?;
+    for selected in &result.selected_observations {
+        writeln!(
+            writer,
+            "{},{},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{}",
+            selected.observation_index,
+            selected.edge_index,
+            selected.direction.as_str(),
+            selected.target_theta,
+            selected.target_phi,
+            selected.edge_theta,
+            selected.edge_phi,
+            selected.toroidal_alignment_sq,
+            selected.selection_distance,
+            selected.used_fallback,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_kappa0_summary(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(out_dir.join("summary.txt"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "Torus 1-form Matérn conditioning (kappa=0, harmonic-free)"
+    )?;
+    writeln!(writer, "major_radius={}", result.major_radius)?;
+    writeln!(writer, "minor_radius={}", result.minor_radius)?;
+    writeln!(writer, "num_rbmc_probes={}", result.num_rbmc_probes)?;
+    writeln!(writer, "rbmc_batch_count={}", result.rbmc_batch_count)?;
+    writeln!(writer, "rng_seed={}", result.rng_seed)?;
+    writeln!(writer, "latent_edge_variances=exact_operator_solve")?;
+    writeln!(
+        writer,
+        "surface_vector_variance_mode={}",
+        result.surface_vector_variance_mode.as_str()
+    )?;
+    writeln!(
+        writer,
+        "observation_count={}",
+        result.selected_observations.len()
+    )?;
+    writeln!(
+        writer,
+        "harmonic_coefficients_truth={},{}",
+        result.harmonic_coefficients_truth[0], result.harmonic_coefficients_truth[1]
+    )?;
+    writeln!(
+        writer,
+        "harmonic_coefficients_posterior_mean={},{}",
+        result.harmonic_coefficients_posterior_mean[0],
+        result.harmonic_coefficients_posterior_mean[1]
+    )?;
+    writeln!(
+        writer,
+        "edge_mean_abs_error={}",
+        mean_feec(&result.absolute_mean_error)
+    )?;
+    writeln!(
+        writer,
+        "edge_max_abs_error={}",
+        max_feec(&result.absolute_mean_error)
+    )?;
+    writeln!(
+        writer,
+        "edge_variance_ratio_mean={}",
+        mean_feec(&ratio_vector(
+            &result.posterior_variance,
+            &result.prior_variance
+        ))
+    )?;
+    writeln!(
+        writer,
+        "circulation_variance_ratio_mean={}",
+        mean_feec(&result.variance_fields.circulation.ratio)
+    )?;
+    write_observed_summary(&mut writer, &result.observed_summary)?;
+    Ok(())
+}
+
+fn write_kappa0_fields_vtk(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let truth = Cochain::new(1, result.truth.clone());
+    let posterior_mean = Cochain::new(1, result.posterior_mean.clone());
+    let absolute_mean_error = Cochain::new(1, result.absolute_mean_error.clone());
+    let prior_variance = Cochain::new(1, result.prior_variance.clone());
+    let posterior_variance = Cochain::new(1, result.posterior_variance.clone());
+    let variance_reduction = Cochain::new(1, result.variance_reduction.clone());
+    let observed_mask = Cochain::new(1, result.observed_mask.clone());
+    let nearest_observation_value = Cochain::new(1, result.nearest_observation_value.clone());
+    let nearest_observation_distance = Cochain::new(1, result.nearest_observation_distance.clone());
+
+    write_1cochain_vtk_fields(
+        out_dir.join("fields.vtk"),
+        &result.coords,
+        &result.topology,
+        &[
+            ("truth", &truth),
+            ("posterior_mean", &posterior_mean),
+            ("absolute_mean_error", &absolute_mean_error),
+            ("prior_variance", &prior_variance),
+            ("posterior_variance", &posterior_variance),
+            ("variance_reduction", &variance_reduction),
+            ("observed_mask", &observed_mask),
+            ("nearest_observation_value", &nearest_observation_value),
+            (
+                "nearest_observation_distance",
+                &nearest_observation_distance,
+            ),
+        ],
+    )?;
+    write_1form_vector_proxy_vtk_fields(
+        out_dir.join("posterior_mean_vector.vtk"),
+        &result.coords,
+        &result.topology,
+        "posterior_mean_vector",
+        &posterior_mean,
+        &[
+            ("truth", &truth),
+            ("absolute_mean_error", &absolute_mean_error),
+            ("posterior_variance", &posterior_variance),
+            ("observed_mask", &observed_mask),
+        ],
+    )?;
+
+    Ok(())
+}
+
+fn write_kappa0_surface_vector_vtk(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let truth = Cochain::new(1, result.truth.clone());
+    let posterior_mean = Cochain::new(1, result.posterior_mean.clone());
+    let truth_vectors = sample_1form_cell_vectors(&result.coords, &result.topology, &truth)?;
+    let posterior_mean_vectors =
+        sample_1form_cell_vectors(&result.coords, &result.topology, &posterior_mean)?;
+    let posterior_mean_magnitude = vector_magnitudes(&posterior_mean_vectors);
+    let surface = &result.variance_fields.surface_vector;
+    let posterior_variance_vectors = ambient_variance_vectors(surface, false);
+    let prior_variance_vectors = ambient_variance_vectors(surface, true);
+    let posterior_marginal_std = surface.trace.posterior.map(|value| value.max(0.0).sqrt());
+
+    write_top_cell_vtk_fields(
+        out_dir.join("posterior_mean_surface_vector.vtk"),
+        &result.coords,
+        &result.topology,
+        &[
+            ("truth_surface_vector", truth_vectors.as_slice()),
+            (
+                "posterior_mean_surface_vector",
+                posterior_mean_vectors.as_slice(),
+            ),
+            (
+                "posterior_directional_variance",
+                posterior_variance_vectors.as_slice(),
+            ),
+            (
+                "prior_directional_variance",
+                prior_variance_vectors.as_slice(),
+            ),
+        ],
+        &[
+            ("magnitude", posterior_mean_magnitude.as_slice()),
+            ("marginal_variance", surface.trace.posterior.as_slice()),
+            ("marginal_std", posterior_marginal_std.as_slice()),
+            ("prior_marginal_variance", surface.trace.prior.as_slice()),
+            ("marginal_variance_ratio", surface.trace.ratio.as_slice()),
+        ],
+    )?;
+
+    Ok(())
+}
+
+fn write_kappa0_edge_csv(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(out_dir.join("edge_fields.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "edge_index,theta,phi,toroidal_alignment_sq,truth,posterior_mean,absolute_mean_error,prior_variance,posterior_variance,variance_reduction,observed_mask,nearest_observation_value,nearest_observation_distance"
+    )?;
+
+    for edge_index in 0..result.truth.len() {
+        writeln!(
+            writer,
+            "{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            edge_index,
+            result.edge_theta[edge_index],
+            result.edge_phi[edge_index],
+            result.toroidal_alignment_sq[edge_index],
+            result.truth[edge_index],
+            result.posterior_mean[edge_index],
+            result.absolute_mean_error[edge_index],
+            result.prior_variance[edge_index],
+            result.posterior_variance[edge_index],
+            result.variance_reduction[edge_index],
+            result.observed_mask[edge_index],
+            result.nearest_observation_value[edge_index],
+            result.nearest_observation_distance[edge_index],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_kappa0_observation_csv(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(out_dir.join("observations.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "observation_index,edge_index,direction,target_theta,target_phi,edge_theta,edge_phi,used_fallback,observation_value,posterior_mean_at_observation,abs_error_at_observation,prior_variance_at_observation,posterior_variance_at_observation"
+    )?;
+
+    for summary in &result.observation_summaries {
+        writeln!(
+            writer,
+            "{},{},{},{:.12},{:.12},{:.12},{:.12},{},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            summary.observation_index,
+            summary.edge_index,
+            summary.direction.as_str(),
+            summary.target_theta,
+            summary.target_phi,
+            summary.edge_theta,
+            summary.edge_phi,
+            summary.used_fallback,
+            summary.observation_value,
+            summary.posterior_mean_at_observation,
+            summary.abs_error_at_observation,
+            summary.prior_variance_at_observation,
+            summary.posterior_variance_at_observation,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_kappa0_variance_field_vtks(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    write_top_cell_scalar_vtk_fields(
+        out_dir.join("reconstructed_component_variance.vtk"),
+        &result.coords,
+        &result.topology,
+        &[
+            (
+                "prior_var_toroidal",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .toroidal
+                    .prior
+                    .as_slice(),
+            ),
+            (
+                "post_var_toroidal",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .toroidal
+                    .posterior
+                    .as_slice(),
+            ),
+            (
+                "ratio_toroidal",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .toroidal
+                    .ratio
+                    .as_slice(),
+            ),
+            (
+                "prior_var_poloidal",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .poloidal
+                    .prior
+                    .as_slice(),
+            ),
+            (
+                "post_var_poloidal",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .poloidal
+                    .posterior
+                    .as_slice(),
+            ),
+            (
+                "ratio_poloidal",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .poloidal
+                    .ratio
+                    .as_slice(),
+            ),
+            (
+                "trace_prior",
+                result.variance_fields.reconstructed.trace.prior.as_slice(),
+            ),
+            (
+                "trace_post",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .trace
+                    .posterior
+                    .as_slice(),
+            ),
+            (
+                "trace_ratio",
+                result.variance_fields.reconstructed.trace.ratio.as_slice(),
+            ),
+        ],
+    )?;
+    write_top_cell_scalar_vtk_fields(
+        out_dir.join("circulation_variance.vtk"),
+        &result.coords,
+        &result.topology,
+        &[
+            (
+                "prior_circulation",
+                result.variance_fields.circulation.prior.as_slice(),
+            ),
+            (
+                "post_circulation",
+                result.variance_fields.circulation.posterior.as_slice(),
+            ),
+            (
+                "ratio_circulation",
+                result.variance_fields.circulation.ratio.as_slice(),
+            ),
+        ],
+    )?;
+    Ok(())
+}
+
+fn mean_feec(values: &FeecVector) -> f64 {
+    if values.is_empty() {
+        f64::NAN
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
+fn max_feec(values: &FeecVector) -> f64 {
+    values.iter().copied().fold(f64::NEG_INFINITY, f64::max)
 }
 
 #[cfg(test)]

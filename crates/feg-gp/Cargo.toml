@@ -10,9 +10,9 @@ formoniq = { path = "../../feec/crates/formoniq" }
 manifold = { path = "../../feec/crates/manifold" }
 exterior = { path = "../../feec/crates/exterior" }
 common = { path = "../../feec/crates/common" }
+ddf = { path = "../../feec/crates/ddf" }
 libm = "0.2"
 
 [dev-dependencies]
-ddf = { path = "../../feec/crates/ddf" }
 rand = { workspace = true }
 rand_distr = { workspace = true }

@@ -1,7 +1,7 @@
 use feg_infer::torus_1form_conditioning::SurfaceVectorVarianceMode;
 use feg_infer::torus_1form_pde_conditioning::{
-    run_torus_1form_pde_conditioning, write_torus_1form_pde_conditioning_outputs,
-    Torus1FormPdeConditioningConfig,
+    run_torus_1form_pde_conditioning_kappa0, write_torus_1form_pde_conditioning_kappa0_outputs,
+    Torus1FormPdeConditioningKappa0Config,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -10,14 +10,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (config, out_dir) = parse_args()?;
     let total_start = Instant::now();
 
-    let result = run_torus_1form_pde_conditioning(&config)?;
-    write_torus_1form_pde_conditioning_outputs(&result, &out_dir)?;
+    let result = run_torus_1form_pde_conditioning_kappa0(&config)?;
+    write_torus_1form_pde_conditioning_kappa0_outputs(&result, &out_dir)?;
 
-    println!("Torus 1-form Matérn PDE conditioning");
+    println!("Torus 1-form Matérn PDE conditioning (kappa=0, harmonic-free)");
     println!("mesh={}", config.mesh_path.display());
     println!(
-        "kappa={} tau={} noise_variance={} surface_vector_variance_mode={} rbmc_probes={} rbmc_batches={} seed={}",
-        config.kappa,
+        "tau={} noise_variance={} surface_vector_variance_mode={} rbmc_probes={} rbmc_batches={} seed={}",
         config.tau,
         config.noise_variance,
         config.surface_vector_variance_mode.as_str(),
@@ -25,10 +24,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.rbmc_batch_count,
         config.rng_seed,
     );
-    println!("effective_range={}", result.effective_range);
     println!(
-        "l2_error={} hd_error={} posterior_relative_residual_norm={}",
-        result.l2_error, result.hd_error, result.posterior_relative_residual_norm
+        "posterior_relative_residual_norm={}",
+        result.posterior_relative_residual_norm
     );
     println!(
         "edge_variance_ratio_mean={} surface_trace_variance_ratio_mean={}",
@@ -41,9 +39,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn parse_args() -> Result<(Torus1FormPdeConditioningConfig, PathBuf), Box<dyn std::error::Error>> {
-    let mut config = Torus1FormPdeConditioningConfig::default();
-    let mut out_dir = PathBuf::from("out/matern_1form_torus_pde_conditioning");
+fn parse_args(
+) -> Result<(Torus1FormPdeConditioningKappa0Config, PathBuf), Box<dyn std::error::Error>> {
+    let mut config = Torus1FormPdeConditioningKappa0Config::default();
+    let mut out_dir = PathBuf::from("out/matern_1form_torus_pde_conditioning_kappa0");
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -53,13 +52,6 @@ fn parse_args() -> Result<(Torus1FormPdeConditioningConfig, PathBuf), Box<dyn st
                     args.next()
                         .ok_or_else(|| invalid_input("missing value for --mesh-path"))?,
                 );
-            }
-            "--kappa" => {
-                config.kappa = parse_f64_arg(
-                    args.next()
-                        .ok_or_else(|| invalid_input("missing value for --kappa"))?,
-                    "--kappa",
-                )?;
             }
             "--tau" => {
                 config.tau = parse_f64_arg(
@@ -125,11 +117,10 @@ fn parse_args() -> Result<(Torus1FormPdeConditioningConfig, PathBuf), Box<dyn st
 
 fn print_usage() {
     println!(
-        "Usage: cargo run --release -p feg-infer --example matern_1form_torus_pde_conditioning -- [options]"
+        "Usage: cargo run --release -p feg-infer --example matern_1form_torus_pde_conditioning_kappa0 -- [options]"
     );
     println!("Options:");
     println!("  --mesh-path <path>          Input torus mesh path");
-    println!("  --kappa <f64>               Matérn kappa parameter");
     println!("  --tau <f64>                 Matérn tau parameter");
     println!("  --noise-variance <f64>      Observation noise variance");
     println!("  --surface-variance-mode <mode>  exact | rbmc | rbmc-clipped");

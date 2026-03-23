@@ -1,5 +1,7 @@
 //! Spectral Gaussian process utilities based on Hodge Laplacian eigenfunctions.
 
+mod hodge;
+
 use common::linalg::nalgebra::{
     quadratic_form_sparse, CsrMatrix, Matrix as NaMatrix, Vector as NaVector,
 };
@@ -16,6 +18,8 @@ use manifold::geometry::metric::mesh::MeshLengths;
 use manifold::topology::complex::Complex;
 use std::cmp::Ordering;
 use thiserror::Error;
+
+pub use hodge::*;
 
 pub const DEFAULT_K: usize = 32;
 
@@ -103,6 +107,23 @@ pub enum GpError {
     CholeskyFailed,
     #[error("standard normal length {got} does not match basis size {expected}")]
     SampleDimensionMismatch { expected: usize, got: usize },
+    #[error("observation matrix column count {got} does not match ambient dimension {expected}")]
+    ObservationMatrixDimensionMismatch { expected: usize, got: usize },
+    #[error(
+        "observation matrix row count {rows} does not match observation value length {values}"
+    )]
+    ObservationValueDimensionMismatch { rows: usize, values: usize },
+    #[error("invalid strong dof index {index} for dimension {dimension}")]
+    InvalidStrongDofIndex { index: usize, dimension: usize },
+    #[error("full vector length {got} does not match full dimension {expected}")]
+    FullDimensionMismatch { expected: usize, got: usize },
+    #[error("reduced vector length {got} does not match reduced dimension {expected}")]
+    ReducedDimensionMismatch { expected: usize, got: usize },
+    #[error("requested harmonic dimension {requested} exceeds reduced space dimension {reduced_dimension}")]
+    InvalidHarmonicDimension {
+        requested: usize,
+        reduced_dimension: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -157,15 +178,26 @@ impl EigenBasis {
     }
 
     pub fn truncate_largest(&self, k: usize) -> Result<Self, GpError> {
+        self.truncate(k, TruncationOrder::Largest)
+    }
+
+    pub fn truncate_smallest(&self, k: usize) -> Result<Self, GpError> {
+        self.truncate(k, TruncationOrder::Smallest)
+    }
+
+    fn truncate(&self, k: usize, order: TruncationOrder) -> Result<Self, GpError> {
         if k == 0 {
             return Err(GpError::InvalidK);
         }
         let keep = k.min(self.eigenvalues.len());
         let mut indices: Vec<usize> = (0..self.eigenvalues.len()).collect();
-        indices.sort_by(|&a, &b| {
-            let left = self.eigenvalues[a];
-            let right = self.eigenvalues[b];
-            right.partial_cmp(&left).unwrap_or(Ordering::Equal)
+        indices.sort_by(|&a, &b| match order {
+            TruncationOrder::Largest => self.eigenvalues[b]
+                .partial_cmp(&self.eigenvalues[a])
+                .unwrap_or(Ordering::Equal),
+            TruncationOrder::Smallest => self.eigenvalues[a]
+                .partial_cmp(&self.eigenvalues[b])
+                .unwrap_or(Ordering::Equal),
         });
 
         let mut values = Vec::with_capacity(keep);
@@ -187,6 +219,12 @@ impl EigenBasis {
             eigenvectors: vectors,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TruncationOrder {
+    Largest,
+    Smallest,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +253,13 @@ impl SpectralMaternGp {
     ) -> Result<Self, GpError> {
         validate_config(config)?;
         let basis = basis.truncate_largest(config.k)?;
+        Self::from_truncated_basis(basis, config)
+    }
+
+    fn from_truncated_basis(
+        basis: EigenBasis,
+        config: SpectralMaternConfig,
+    ) -> Result<Self, GpError> {
         let mut weights = Vec::with_capacity(basis.len());
         for &lambda in basis.eigenvalues() {
             weights.push(matern_weight(lambda, config)?);
@@ -318,6 +363,14 @@ impl SpectralMaternGp {
         self.config
     }
 
+    pub fn feature_matrix(&self) -> Mat<f64> {
+        weighted_feature_matrix(self.basis.eigenvectors(), &self.weights)
+    }
+
+    pub fn prior_variance(&self) -> Vec<f64> {
+        diagonal_from_feature_matrix(&self.feature_matrix())
+    }
+
     pub fn sample_from_standard_normal(&self, z: &[f64]) -> Result<Vec<f64>, GpError> {
         let k = self.weights.len();
         if z.len() != k {
@@ -339,6 +392,34 @@ impl SpectralMaternGp {
             }
         }
         Ok(sample)
+    }
+
+    pub fn condition_linear_observations(
+        &self,
+        observation_matrix: &CsrMatrix,
+        observation_values: &[f64],
+        noise_variance: f64,
+    ) -> Result<ConditionedGp, GpError> {
+        condition_low_rank_factors(
+            &self.feature_matrix(),
+            observation_matrix,
+            observation_values,
+            noise_variance,
+        )
+    }
+
+    pub fn condition_linear_observations_with_covariance(
+        &self,
+        observation_matrix: &CsrMatrix,
+        observation_values: &[f64],
+        noise_variance: f64,
+    ) -> Result<ConditionedFullGp, GpError> {
+        condition_low_rank_factors_with_covariance(
+            &self.feature_matrix(),
+            observation_matrix,
+            observation_values,
+            noise_variance,
+        )
     }
 }
 
@@ -595,6 +676,268 @@ pub fn condition_full_covariance_with_covariance(
         mean: mat_col_to_vec(&posterior_mean),
         covariance: posterior_cov,
     })
+}
+
+pub(crate) fn weighted_feature_matrix(eigenvectors: &Mat<f64>, weights: &[f64]) -> Mat<f64> {
+    let mut features = eigenvectors.clone();
+    for (col, &weight) in weights.iter().enumerate() {
+        let scale = weight.max(0.0).sqrt();
+        for row in 0..features.nrows() {
+            features[(row, col)] *= scale;
+        }
+    }
+    features
+}
+
+pub(crate) fn diagonal_from_feature_matrix(features: &Mat<f64>) -> Vec<f64> {
+    let mut diagonal = Vec::with_capacity(features.nrows());
+    for row in 0..features.nrows() {
+        let mut value = 0.0;
+        for col in 0..features.ncols() {
+            let entry = features[(row, col)];
+            value += entry * entry;
+        }
+        diagonal.push(value.max(0.0));
+    }
+    diagonal
+}
+
+pub(crate) fn condition_low_rank_factors(
+    features: &Mat<f64>,
+    observation_matrix: &CsrMatrix,
+    observation_values: &[f64],
+    noise_variance: f64,
+) -> Result<ConditionedGp, GpError> {
+    let conditioned = condition_low_rank_factors_impl(
+        features,
+        observation_matrix,
+        observation_values,
+        noise_variance,
+        false,
+    )?;
+    Ok(ConditionedGp {
+        mean: conditioned.mean,
+        variance: conditioned.variance,
+    })
+}
+
+pub(crate) fn condition_low_rank_factors_with_covariance(
+    features: &Mat<f64>,
+    observation_matrix: &CsrMatrix,
+    observation_values: &[f64],
+    noise_variance: f64,
+) -> Result<ConditionedFullGp, GpError> {
+    let conditioned = condition_low_rank_factors_impl(
+        features,
+        observation_matrix,
+        observation_values,
+        noise_variance,
+        true,
+    )?;
+    let covariance = conditioned
+        .covariance
+        .expect("full covariance requested must produce covariance");
+    Ok(ConditionedFullGp {
+        mean: conditioned.mean,
+        covariance,
+    })
+}
+
+struct LowRankConditioningResult {
+    mean: Vec<f64>,
+    variance: Vec<f64>,
+    covariance: Option<Mat<f64>>,
+}
+
+fn condition_low_rank_factors_impl(
+    features: &Mat<f64>,
+    observation_matrix: &CsrMatrix,
+    observation_values: &[f64],
+    noise_variance: f64,
+    need_covariance: bool,
+) -> Result<LowRankConditioningResult, GpError> {
+    validate_linear_observations(
+        features.nrows(),
+        observation_matrix,
+        observation_values,
+        noise_variance,
+    )?;
+
+    let n = features.nrows();
+    let latent_dim = features.ncols();
+    let observation_count = observation_matrix.nrows();
+
+    if observation_count == 0 {
+        let covariance = if need_covariance {
+            Some(full_covariance_from_feature_matrix(features))
+        } else {
+            None
+        };
+        return Ok(LowRankConditioningResult {
+            mean: vec![0.0; n],
+            variance: diagonal_from_feature_matrix(features),
+            covariance,
+        });
+    }
+
+    let obs_features = sparse_dense_product(observation_matrix, features)?;
+    let observations = Mat::from_fn(observation_count, 1, |row, _| {
+        observation_values[row.unbound()]
+    });
+
+    let mut gram = Mat::zeros(observation_count, observation_count);
+    matmul(
+        &mut gram,
+        Accum::Replace,
+        obs_features.as_ref(),
+        obs_features.as_ref().transpose(),
+        1.0,
+        Par::Seq,
+    );
+    for row in 0..observation_count {
+        gram[(idx(row), idx(row))] += noise_variance;
+    }
+
+    let chol = gram.llt(Side::Lower).map_err(|_| GpError::CholeskyFailed)?;
+
+    let mut solved_observations = observations.clone();
+    chol.solve_in_place(solved_observations.as_mut());
+
+    let mut feature_rhs = Mat::zeros(latent_dim, 1);
+    matmul(
+        &mut feature_rhs,
+        Accum::Replace,
+        obs_features.as_ref().transpose(),
+        solved_observations.as_ref(),
+        1.0,
+        Par::Seq,
+    );
+
+    let mut posterior_mean = Mat::zeros(n, 1);
+    matmul(
+        &mut posterior_mean,
+        Accum::Replace,
+        features.as_ref(),
+        feature_rhs.as_ref(),
+        1.0,
+        Par::Seq,
+    );
+
+    let mut solved_obs_features = obs_features.clone();
+    chol.solve_in_place(solved_obs_features.as_mut());
+
+    let mut correction = Mat::zeros(latent_dim, latent_dim);
+    matmul(
+        &mut correction,
+        Accum::Replace,
+        obs_features.as_ref().transpose(),
+        solved_obs_features.as_ref(),
+        1.0,
+        Par::Seq,
+    );
+
+    let mut latent_covariance: Mat<f64> = Mat::identity(latent_dim, latent_dim);
+    for row in 0..latent_dim {
+        for col in 0..latent_dim {
+            latent_covariance[(idx(row), idx(col))] -= correction[(idx(row), idx(col))];
+        }
+    }
+
+    let mut feature_latent_covariance = Mat::zeros(n, latent_dim);
+    matmul(
+        &mut feature_latent_covariance,
+        Accum::Replace,
+        features.as_ref(),
+        latent_covariance.as_ref(),
+        1.0,
+        Par::Seq,
+    );
+
+    let mut variance = Vec::with_capacity(n);
+    for row in 0..n {
+        let mut value = 0.0;
+        for col in 0..latent_dim {
+            value +=
+                feature_latent_covariance[(idx(row), idx(col))] * features[(idx(row), idx(col))];
+        }
+        variance.push(value.max(0.0));
+    }
+
+    let covariance = if need_covariance {
+        let mut posterior_covariance = Mat::zeros(n, n);
+        matmul(
+            &mut posterior_covariance,
+            Accum::Replace,
+            feature_latent_covariance.as_ref(),
+            features.as_ref().transpose(),
+            1.0,
+            Par::Seq,
+        );
+        Some(posterior_covariance)
+    } else {
+        None
+    };
+
+    Ok(LowRankConditioningResult {
+        mean: mat_col_to_vec(&posterior_mean),
+        variance,
+        covariance,
+    })
+}
+
+pub(crate) fn full_covariance_from_feature_matrix(features: &Mat<f64>) -> Mat<f64> {
+    let n = features.nrows();
+    let mut covariance = Mat::zeros(n, n);
+    matmul(
+        &mut covariance,
+        Accum::Replace,
+        features.as_ref(),
+        features.as_ref().transpose(),
+        1.0,
+        Par::Seq,
+    );
+    covariance
+}
+
+fn validate_linear_observations(
+    ambient_dimension: usize,
+    observation_matrix: &CsrMatrix,
+    observation_values: &[f64],
+    noise_variance: f64,
+) -> Result<(), GpError> {
+    if observation_matrix.ncols() != ambient_dimension {
+        return Err(GpError::ObservationMatrixDimensionMismatch {
+            expected: ambient_dimension,
+            got: observation_matrix.ncols(),
+        });
+    }
+    if observation_matrix.nrows() != observation_values.len() {
+        return Err(GpError::ObservationValueDimensionMismatch {
+            rows: observation_matrix.nrows(),
+            values: observation_values.len(),
+        });
+    }
+    if !noise_variance.is_finite() || noise_variance < 0.0 {
+        return Err(GpError::InvalidNoiseVariance);
+    }
+    Ok(())
+}
+
+pub(crate) fn sparse_dense_product(lhs: &CsrMatrix, rhs: &Mat<f64>) -> Result<Mat<f64>, GpError> {
+    if lhs.ncols() != rhs.nrows() {
+        return Err(GpError::ObservationMatrixDimensionMismatch {
+            expected: rhs.nrows(),
+            got: lhs.ncols(),
+        });
+    }
+
+    let mut product = Mat::zeros(lhs.nrows(), rhs.ncols());
+    for (row, col, value) in lhs.triplet_iter() {
+        for dense_col in 0..rhs.ncols() {
+            product[(row, dense_col)] += *value * rhs[(col, dense_col)];
+        }
+    }
+    Ok(product)
 }
 
 fn validate_config(config: SpectralMaternConfig) -> Result<(), GpError> {
@@ -1007,5 +1350,64 @@ mod tests {
             let norm2 = quadratic_form_sparse(&mass, &vec);
             assert_close(norm2, 1.0, 1e-12);
         }
+    }
+
+    #[test]
+    fn smallest_truncation_keeps_smallest_eigenvalues() {
+        let mut eigenvectors = Mat::zeros(3, 3);
+        eigenvectors[(0, 0)] = 1.0;
+        eigenvectors[(1, 1)] = 1.0;
+        eigenvectors[(2, 2)] = 1.0;
+        let basis = EigenBasis::new(vec![3.0, 1.0, 2.0], eigenvectors).unwrap();
+
+        let truncated = basis.truncate_smallest(2).unwrap();
+        assert_eq!(truncated.eigenvalues(), &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn low_rank_linear_conditioning_matches_dense_conditioning() {
+        use common::linalg::nalgebra::CooMatrix;
+
+        let mut eigenvectors = Mat::zeros(2, 2);
+        eigenvectors[(0, 0)] = 1.0;
+        eigenvectors[(1, 1)] = 1.0;
+        let eigenvalues = vec![3.0, 1.0];
+        let basis = EigenBasis::new(eigenvalues, eigenvectors).unwrap();
+        let config = SpectralMaternConfig {
+            kappa: 1.0,
+            alpha: 2.0,
+            tau: 1.0,
+            k: 2,
+        };
+        let gp = SpectralMaternGp::from_eigenbasis(basis, config).unwrap();
+
+        let mut observation_matrix = CooMatrix::new(1, 2);
+        observation_matrix.push(0, 0, 1.0);
+        observation_matrix.push(0, 1, 0.5);
+        let observation_matrix = CsrMatrix::from(&observation_matrix);
+        let observation_values = vec![1.25];
+        let dense_covariance = gp.covariance_matrix();
+        let noise_variance = 1e-9;
+
+        let low_rank = gp
+            .condition_linear_observations(&observation_matrix, &observation_values, noise_variance)
+            .unwrap();
+
+        let a0 = 1.0_f64;
+        let a1 = 0.5_f64;
+        let s = dense_covariance[(idx(0), idx(0))] * a0 * a0
+            + 2.0 * dense_covariance[(idx(0), idx(1))] * a0 * a1
+            + dense_covariance[(idx(1), idx(1))] * a1 * a1
+            + noise_variance;
+        let gain0 =
+            (dense_covariance[(idx(0), idx(0))] * a0 + dense_covariance[(idx(0), idx(1))] * a1) / s;
+        let gain1 =
+            (dense_covariance[(idx(1), idx(0))] * a0 + dense_covariance[(idx(1), idx(1))] * a1) / s;
+        let dense_mean0 = gain0 * observation_values[0];
+        let dense_mean1 = gain1 * observation_values[0];
+
+        assert_close(low_rank.mean[0], dense_mean0, 1e-8);
+        assert_close(low_rank.mean[1], dense_mean1, 1e-8);
+        assert!(low_rank.variance.iter().all(|value| value.is_finite()));
     }
 }

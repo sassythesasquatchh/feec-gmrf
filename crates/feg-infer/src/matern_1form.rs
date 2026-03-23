@@ -107,10 +107,20 @@ impl ReconstructedBarycenterFieldOperator {
         self.ambient_dim
     }
 
+    pub fn component_count(&self) -> usize {
+        self.component_operators.len()
+    }
+
     pub fn cell_count(&self) -> usize {
         self.component_operators
             .first()
             .map_or(0, SparseRowLinearOperator::nrows)
+    }
+
+    pub fn component_rows(&self, component_index: usize) -> Option<&[Vec<(usize, f64)>]> {
+        self.component_operators
+            .get(component_index)
+            .map(|operator| operator.rows.as_slice())
     }
 
     pub fn apply_to_slice(&self, input: &[f64]) -> Result<ReconstructedBarycenterField, String> {

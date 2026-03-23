@@ -262,10 +262,14 @@ fn diagonal_variance(cov: &Mat<f64>) -> Result<Vec<f64>, Box<dyn std::error::Err
 
 fn petsc_solver_available() -> bool {
     if let Ok(path) = std::env::var("PETSC_SOLVER_PATH") {
-        let candidate = PathBuf::from(path).join("ghiep.out");
-        return candidate.exists();
+        if !path.is_empty() {
+            let candidate = PathBuf::from(path).join("ghiep.out");
+            return candidate.exists();
+        }
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../feec/petsc-solver/ghiep.out")
-        .exists()
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .ancestors()
+        .map(|ancestor| ancestor.join("feec/petsc-solver/ghiep.out"))
+        .any(|candidate| candidate.exists())
 }

@@ -44,16 +44,17 @@ fn torus_1form_pde_conditioning_builds_and_is_finite() {
     assert_eq!(result.pde_residual.len(), ndofs);
     assert!(result.truth.iter().all(|value| value.is_finite()));
     assert!(result.posterior_mean.iter().all(|value| value.is_finite()));
-    assert!(result.posterior_variance.iter().all(|value| value.is_finite()));
-    assert!(
-        result
-            .variance_fields
-            .surface_vector
-            .trace
-            .ratio
-            .iter()
-            .all(|value| value.is_finite())
-    );
+    assert!(result
+        .posterior_variance
+        .iter()
+        .all(|value| value.is_finite()));
+    assert!(result
+        .variance_fields
+        .surface_vector
+        .trace
+        .ratio
+        .iter()
+        .all(|value| value.is_finite()));
     assert!(result.l2_error.is_finite());
     assert!(result.hd_error.is_finite());
 }

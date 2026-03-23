@@ -1,7 +1,7 @@
 use feg_infer::torus_1form_conditioning::SurfaceVectorVarianceMode;
-use feg_infer::torus_1form_pde_conditioning::{
-    run_torus_1form_pde_conditioning, write_torus_1form_pde_conditioning_outputs,
-    Torus1FormPdeConditioningConfig,
+use feg_infer::torus_1form_pde_hodge_conditioning::{
+    run_torus_1form_pde_hodge_conditioning, write_torus_1form_pde_hodge_conditioning_outputs,
+    Torus1FormPdeHodgeBranchResult, Torus1FormPdeHodgeConditioningConfig,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -10,10 +10,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (config, out_dir) = parse_args()?;
     let total_start = Instant::now();
 
-    let result = run_torus_1form_pde_conditioning(&config)?;
-    write_torus_1form_pde_conditioning_outputs(&result, &out_dir)?;
+    let result = run_torus_1form_pde_hodge_conditioning(&config)?;
+    write_torus_1form_pde_hodge_conditioning_outputs(&result, &out_dir)?;
 
-    println!("Torus 1-form Matérn PDE conditioning");
+    println!("Torus 1-form Matérn PDE Hodge-split conditioning");
     println!("mesh={}", config.mesh_path.display());
     println!(
         "kappa={} tau={} noise_variance={} surface_vector_variance_mode={} rbmc_probes={} rbmc_batches={} seed={}",
@@ -25,25 +25,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.rbmc_batch_count,
         config.rng_seed,
     );
-    println!("effective_range={}", result.effective_range);
     println!(
-        "l2_error={} hd_error={} posterior_relative_residual_norm={}",
-        result.l2_error, result.hd_error, result.posterior_relative_residual_norm
+        "full: posterior_relative_residual_norm={} l2_error={} hd_error={}",
+        result.full.posterior_relative_residual_norm, result.full.l2_error, result.full.hd_error
     );
-    println!(
-        "edge_variance_ratio_mean={} surface_trace_variance_ratio_mean={}",
-        mean(&result.variance_ratio),
-        mean(&result.variance_fields.surface_vector.trace.ratio),
-    );
+    print_branch_summary(&result.exact);
+    print_branch_summary(&result.coexact);
+    print_branch_summary(&result.harmonic);
     println!("wrote outputs to {}", out_dir.display());
     println!("total runtime: {:.3}s", total_start.elapsed().as_secs_f64());
 
     Ok(())
 }
 
-fn parse_args() -> Result<(Torus1FormPdeConditioningConfig, PathBuf), Box<dyn std::error::Error>> {
-    let mut config = Torus1FormPdeConditioningConfig::default();
-    let mut out_dir = PathBuf::from("out/matern_1form_torus_pde_conditioning");
+fn parse_args(
+) -> Result<(Torus1FormPdeHodgeConditioningConfig, PathBuf), Box<dyn std::error::Error>> {
+    let mut config = Torus1FormPdeHodgeConditioningConfig::default();
+    let mut out_dir = PathBuf::from("out/matern_1form_torus_pde_hodge_conditioning");
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -125,7 +123,7 @@ fn parse_args() -> Result<(Torus1FormPdeConditioningConfig, PathBuf), Box<dyn st
 
 fn print_usage() {
     println!(
-        "Usage: cargo run --release -p feg-infer --example matern_1form_torus_pde_conditioning -- [options]"
+        "Usage: cargo run --release -p feg-infer --example matern_1form_torus_pde_hodge_conditioning -- [options]"
     );
     println!("Options:");
     println!("  --mesh-path <path>          Input torus mesh path");
@@ -137,6 +135,22 @@ fn print_usage() {
     println!("  --rbmc-batch-count <usize>  RBMC batch count");
     println!("  --seed <u64>                RNG seed");
     println!("  --out-dir <path>            Output directory");
+}
+
+fn print_branch_summary(branch: &Torus1FormPdeHodgeBranchResult) {
+    println!("branch={}", branch.kind.as_str());
+    println!(
+        "  latent_dimension={} posterior_relative_residual_norm={} l2_error={} hd_error={}",
+        branch.latent_dimension,
+        branch.conditioning.posterior_relative_residual_norm,
+        branch.conditioning.l2_error,
+        branch.conditioning.hd_error
+    );
+    println!(
+        "  curl_residual_relative={} coclosed_residual_relative={}",
+        branch.posterior_bias_diagnostics.curl_residual_relative,
+        branch.posterior_bias_diagnostics.coclosed_residual_relative
+    );
 }
 
 fn parse_f64_arg(value: String, flag: &str) -> Result<f64, Box<dyn std::error::Error>> {
@@ -155,14 +169,6 @@ fn parse_u64_arg(value: String, flag: &str) -> Result<u64, Box<dyn std::error::E
     value
         .parse::<u64>()
         .map_err(|err| invalid_input(format!("invalid value for {flag}: {err}")).into())
-}
-
-fn mean(values: &common::linalg::nalgebra::Vector<f64>) -> f64 {
-    if values.is_empty() {
-        f64::NAN
-    } else {
-        values.iter().sum::<f64>() / values.len() as f64
-    }
 }
 
 fn invalid_input(message: impl Into<String>) -> std::io::Error {

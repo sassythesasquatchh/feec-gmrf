@@ -526,6 +526,13 @@ fn torus_1form_conditioning_local_variance_reduction_is_orientation_sensitive_an
         "expected per-observation raw edge VTK"
     );
 
+    let surface_vtk = fs::read_to_string(
+        out_dir.join("harmonic_free_constrained/posterior_mean_surface_vector.vtk"),
+    )
+    .expect("surface vector VTK should be readable as text");
+    assert!(surface_vtk.contains("VECTORS truth_surface_vector double"));
+    assert!(surface_vtk.contains("VECTORS posterior_mean_surface_vector double"));
+
     let _ = fs::remove_dir_all(&out_dir);
 }
 

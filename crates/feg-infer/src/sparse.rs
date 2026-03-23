@@ -15,6 +15,10 @@ pub fn feec_vec_to_gmrf(vec: &FeecVector) -> GmrfVector {
     GmrfVector::from_vec(vec.iter().copied().collect())
 }
 
+pub fn gmrf_vec_to_feec(vec: &GmrfVector) -> FeecVector {
+    FeecVector::from_vec(vec.iter().copied().collect())
+}
+
 pub fn feec_csr_to_dense(mat: &FeecCsr) -> FeecMatrix {
     let mut dense = FeecMatrix::zeros(mat.nrows(), mat.ncols());
     for (row, col, value) in mat.triplet_iter() {
@@ -41,6 +45,16 @@ pub(crate) fn lumped_diag(mat: &FeecCsr) -> Vec<f64> {
     let mut diag = vec![0.0; mat.nrows()];
     for (row, _col, value) in mat.triplet_iter() {
         diag[row] += *value;
+    }
+    diag
+}
+
+pub(crate) fn matrix_diag(mat: &FeecCsr) -> Vec<f64> {
+    let mut diag = vec![0.0; mat.nrows()];
+    for (row, col, value) in mat.triplet_iter() {
+        if row == col {
+            diag[row] += *value;
+        }
     }
     diag
 }

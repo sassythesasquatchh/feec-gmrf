@@ -3,6 +3,7 @@ mod torus_1form_kappa0_support;
 
 pub mod diagnostics;
 pub mod hodge_1form_conditioning;
+pub mod linear_conditioning;
 pub mod matern_0form;
 pub mod matern_1form;
 pub mod matern_2form;

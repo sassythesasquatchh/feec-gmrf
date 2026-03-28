@@ -2,6 +2,10 @@ use crate::diagnostics::{
     build_analytic_torus_harmonic_basis, build_harmonic_orthogonality_constraints,
     infer_torus_radii,
 };
+use crate::linear_conditioning::{
+    DerivedOperator, DerivedOperatorSet, DerivedVarianceMode, HarmonicSubspace,
+    LinearGaussianConditioningProblem, RbmcConfig,
+};
 use crate::matern_1form::{
     build_hodge_laplacian_1form, build_matern_precision_1form, build_matern_system_matrix_1form,
     feec_csr_to_gmrf, feec_vec_to_gmrf, HodgeLaplacian1Form, MaternConfig, MaternMassInverse,
@@ -23,11 +27,12 @@ use faer::linalg::solvers::Solve;
 use faer::Side;
 use formoniq::fe::fe_l2_error;
 use formoniq::io::{sample_1form_cell_vectors, write_top_cell_vtk_fields};
+use formoniq::torus_convergence::build_torus_reference_fields;
 use gmrf_core::observation::apply_gaussian_observations;
 use gmrf_core::types::{
     DenseMatrix as GmrfDenseMatrix, SparseMatrix as GmrfSparseMatrix, Vector as GmrfVector,
 };
-use gmrf_core::{Gmrf, GmrfError};
+use gmrf_core::{Gmrf, GmrfError, SparseRowOperator, TransformedVarianceDecomposition};
 use manifold::{
     geometry::{
         coord::{
@@ -41,7 +46,6 @@ use manifold::{
 };
 use rand::{Rng, SeedableRng};
 use rand_distr::StandardNormal;
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -153,11 +157,7 @@ pub(crate) struct PreparedTorus1FormPdeProblem {
     pub effective_range: f64,
 }
 
-#[derive(Clone)]
-pub(crate) struct SparseRowLinearOperator {
-    ncols: usize,
-    rows: Vec<Vec<(usize, f64)>>,
-}
+pub(crate) type SparseRowLinearOperator = SparseRowOperator;
 
 pub(crate) struct TorusEdgeGeometry {
     pub major_radius: f64,
@@ -204,149 +204,57 @@ pub fn default_torus_shell_resolution_1_mesh_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../meshes/torus_shell_resolution_1.msh")
 }
 
-impl SparseRowLinearOperator {
-    pub(crate) fn new(ncols: usize, rows: Vec<Vec<(usize, f64)>>) -> Result<Self, String> {
-        if rows
-            .iter()
-            .flatten()
-            .any(|(col, value)| *col >= ncols || !value.is_finite())
-        {
-            return Err(
-                "sparse row operator contains invalid column indices or non-finite values"
-                    .to_string(),
-            );
+pub(crate) fn sparse_row_operator_from_feec_sparse(
+    matrix: &FeecCsr,
+) -> Result<SparseRowLinearOperator, String> {
+    let mut rows = vec![Vec::new(); matrix.nrows()];
+    for (row, col, value) in matrix.triplet_iter() {
+        if value.abs() > EPS {
+            rows[row].push((col, *value));
         }
-        Ok(Self { ncols, rows })
     }
+    SparseRowLinearOperator::new(matrix.ncols(), rows).map_err(|err| err.to_string())
+}
 
-    pub(crate) fn from_sparse_matrix(matrix: &FeecCsr) -> Result<Self, String> {
-        let mut rows = vec![Vec::new(); matrix.nrows()];
-        for (row, col, value) in matrix.triplet_iter() {
-            if value.abs() > EPS {
-                rows[row].push((col, *value));
+pub(crate) fn sparse_row_operator_from_feec_dense(
+    matrix: &FeecMatrix,
+    drop_tolerance: f64,
+) -> Result<SparseRowLinearOperator, String> {
+    let tol = drop_tolerance.abs();
+    let mut rows = Vec::with_capacity(matrix.nrows());
+    for row in 0..matrix.nrows() {
+        let mut entries = Vec::new();
+        for col in 0..matrix.ncols() {
+            let value = matrix[(row, col)];
+            if value.abs() > tol {
+                entries.push((col, value));
             }
         }
-        Self::new(matrix.ncols(), rows)
+        rows.push(entries);
+    }
+    SparseRowLinearOperator::new(matrix.ncols(), rows).map_err(|err| err.to_string())
+}
+
+pub(crate) fn sparse_row_operator_apply_feec(
+    operator: &SparseRowLinearOperator,
+    input: &FeecVector,
+) -> Result<FeecVector, String> {
+    if input.len() != operator.ncols {
+        return Err(format!(
+            "operator input length {} does not match expected column count {}",
+            input.len(),
+            operator.ncols
+        ));
     }
 
-    pub(crate) fn from_dense_matrix(
-        matrix: &FeecMatrix,
-        drop_tolerance: f64,
-    ) -> Result<Self, String> {
-        let tol = drop_tolerance.abs();
-        let mut rows = Vec::with_capacity(matrix.nrows());
-        for row in 0..matrix.nrows() {
-            let mut entries = Vec::new();
-            for col in 0..matrix.ncols() {
-                let value = matrix[(row, col)];
-                if value.abs() > tol {
-                    entries.push((col, value));
-                }
-            }
-            rows.push(entries);
-        }
-        Self::new(matrix.ncols(), rows)
-    }
-
-    pub(crate) fn identity(size: usize) -> Self {
-        Self {
-            ncols: size,
-            rows: (0..size).map(|i| vec![(i, 1.0)]).collect(),
-        }
-    }
-
-    pub(crate) fn nrows(&self) -> usize {
-        self.rows.len()
-    }
-
-    pub(crate) fn apply(&self, input: &GmrfVector) -> GmrfVector {
-        GmrfVector::from_iterator(
-            self.nrows(),
-            self.rows.iter().map(|row| {
-                row.iter()
-                    .map(|(col, value)| *value * input[*col])
-                    .sum::<f64>()
-            }),
-        )
-    }
-
-    pub(crate) fn apply_feec(&self, input: &FeecVector) -> Result<FeecVector, String> {
-        if input.len() != self.ncols {
-            return Err(format!(
-                "operator input length {} does not match expected column count {}",
-                input.len(),
-                self.ncols
-            ));
-        }
-
-        Ok(FeecVector::from_iterator(
-            self.nrows(),
-            self.rows.iter().map(|row| {
-                row.iter()
-                    .map(|(col, value)| *value * input[*col])
-                    .sum::<f64>()
-            }),
-        ))
-    }
-
-    pub(crate) fn apply_transpose(&self, input: &GmrfVector) -> GmrfVector {
-        let mut out = GmrfVector::zeros(self.ncols);
-        for (row_index, row) in self.rows.iter().enumerate() {
-            let weight = input[row_index];
-            if weight == 0.0 {
-                continue;
-            }
-            for (col, value) in row {
-                out[*col] += weight * *value;
-            }
-        }
-        out
-    }
-
-    pub(crate) fn stack(operators: &[&SparseRowLinearOperator]) -> Result<Self, String> {
-        let Some(first) = operators.first() else {
-            return Err("at least one operator is required for stacking".to_string());
-        };
-        let ncols = first.ncols;
-        if operators.iter().any(|operator| operator.ncols != ncols) {
-            return Err("all stacked operators must have the same column count".to_string());
-        }
-
-        let mut rows = Vec::new();
-        for operator in operators {
-            rows.extend(operator.rows.iter().cloned());
-        }
-        Ok(Self { ncols, rows })
-    }
-
-    pub(crate) fn compose(
-        left: &SparseRowLinearOperator,
-        right: &SparseRowLinearOperator,
-    ) -> Result<Self, String> {
-        if left.ncols != right.nrows() {
-            return Err("operator dimensions are incompatible for composition".to_string());
-        }
-
-        let mut rows = Vec::with_capacity(left.nrows());
-        for left_row in &left.rows {
-            let mut combined = BTreeMap::<usize, f64>::new();
-            for (intermediate, weight) in left_row {
-                for (col, value) in &right.rows[*intermediate] {
-                    *combined.entry(*col).or_insert(0.0) += *weight * *value;
-                }
-            }
-            let row = combined
-                .into_iter()
-                .filter_map(|(col, value)| (value.abs() > EPS).then_some((col, value)))
-                .collect::<Vec<_>>();
-            rows.push(row);
-        }
-
-        Ok(Self {
-            ncols: right.ncols,
-            rows,
-        })
-    }
+    Ok(FeecVector::from_iterator(
+        operator.nrows(),
+        operator.rows.iter().map(|row| {
+            row.iter()
+                .map(|(col, value)| *value * input[*col])
+                .sum::<f64>()
+        }),
+    ))
 }
 
 pub fn run_torus_1form_pde_conditioning(
@@ -399,7 +307,7 @@ pub(crate) fn prepare_torus_1form_pde_problem(
         build_harmonic_orthogonality_constraints(&harmonic_basis, &hodge.mass_u)
             .map_err(invalid_data)?;
 
-    let (u_exact, _dif_solution_exact) = build_torus_convergence_fields();
+    let (u_exact, _dif_solution_exact) = build_torus_reference_fields();
     let truth_cochain = cochain_projection(&u_exact, &topology, &coords, None);
     let truth = truth_cochain.coeffs.clone();
     let rhs = &system_matrix * &truth;
@@ -425,25 +333,25 @@ pub(crate) fn prepare_torus_1form_pde_problem(
         build_embedded_component_operator(&topology, &coords, 2).map_err(invalid_data)?;
     let reconstructed_stacked_operator =
         SparseRowLinearOperator::stack(&[&toroidal_operator, &poloidal_operator])
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
     let surface_vector_stacked_operator = SparseRowLinearOperator::stack(&[
         &surface_x_operator,
         &surface_y_operator,
         &surface_z_operator,
     ])
-    .map_err(invalid_data)?;
+    .map_err(|err| invalid_data(err.to_string()))?;
     let smoothing_operator =
         build_gaussian_smoothing_operator(&cell_geometry, smoothing_bandwidth, smoothing_cutoff)
             .map_err(invalid_data)?;
     let smoothed_toroidal_operator =
         SparseRowLinearOperator::compose(&smoothing_operator, &toroidal_operator)
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
     let smoothed_poloidal_operator =
         SparseRowLinearOperator::compose(&smoothing_operator, &poloidal_operator)
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
     let smoothed_stacked_operator =
         SparseRowLinearOperator::stack(&[&smoothed_toroidal_operator, &smoothed_poloidal_operator])
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
     let circulation_operator =
         build_local_circulation_operator(&topology, hodge.mass_u.nrows()).map_err(invalid_data)?;
 
@@ -482,136 +390,141 @@ pub(crate) fn run_prepared_torus_1form_pde_conditioning(
         },
     );
     let q_prior = feec_csr_to_gmrf(&prior_precision);
-    let observation_matrix = feec_csr_to_gmrf(&prepared.system_matrix);
-    let observations = feec_vec_to_gmrf(&prepared.rhs);
-    let (posterior_precision, information) = apply_gaussian_observations(
-        &q_prior,
-        &observation_matrix,
-        &observations,
-        None,
-        config.noise_variance,
+    let mut derived_operators = DerivedOperatorSet::new();
+    derived_operators.insert(
+        "reconstructed".to_string(),
+        DerivedOperator {
+            operator: prepared.reconstructed_stacked_operator.clone(),
+            variance_mode: DerivedVarianceMode::Rbmc,
+        },
     );
-    let posterior = Gmrf::from_information_and_precision(information, posterior_precision.clone())?;
-    let posterior_mean = gmrf_vec_to_feec(posterior.mean());
+    derived_operators.insert(
+        "surface_vector".to_string(),
+        DerivedOperator {
+            operator: prepared.surface_vector_stacked_operator.clone(),
+            variance_mode: match config.surface_vector_variance_mode {
+                SurfaceVectorVarianceMode::Exact => DerivedVarianceMode::Exact,
+                SurfaceVectorVarianceMode::Rbmc | SurfaceVectorVarianceMode::RbmcClipped => {
+                    DerivedVarianceMode::Rbmc
+                }
+            },
+        },
+    );
+    derived_operators.insert(
+        "smoothed".to_string(),
+        DerivedOperator {
+            operator: prepared.smoothed_stacked_operator.clone(),
+            variance_mode: DerivedVarianceMode::Rbmc,
+        },
+    );
+    derived_operators.insert(
+        "circulation".to_string(),
+        DerivedOperator {
+            operator: prepared.circulation_operator.clone(),
+            variance_mode: DerivedVarianceMode::Rbmc,
+        },
+    );
 
-    let mut prior_workspace = build_rbmc_workspace(&q_prior, &prepared.harmonic_constraints)?;
-    let prior_latent_variances =
-        exact_latent_variances(&mut prior_workspace, &prepared.harmonic_constraints)?;
-    let mut posterior_workspace =
-        build_rbmc_workspace(&posterior_precision, &prepared.harmonic_constraints)?;
-    let posterior_latent_variances =
-        exact_latent_variances(&mut posterior_workspace, &prepared.harmonic_constraints)?;
+    let conditioning = LinearGaussianConditioningProblem {
+        prior_precision: q_prior,
+        observation_operator: feec_csr_to_gmrf(&prepared.system_matrix),
+        observations: feec_vec_to_gmrf(&prepared.rhs),
+        noise_variance: config.noise_variance,
+        harmonic_subspace: Some(HarmonicSubspace {
+            basis: prepared.harmonic_basis_orthonormal.clone(),
+            constraints: prepared.harmonic_constraints.clone(),
+            projector: None,
+        }),
+        derived_operators,
+        rbmc: RbmcConfig {
+            num_probes: config.num_rbmc_probes,
+            batch_count: config.rbmc_batch_count,
+            rng_seed: config.rng_seed,
+        },
+    }
+    .solve()?;
 
+    let posterior_mean = gmrf_vec_to_feec(&conditioning.posterior_mean);
     let cell_count = prepared.cell_geometry.theta.len();
     let reconstructed_prior = split_component_estimates(
-        estimate_transformed_rbmc_variances(
-            &mut prior_workspace,
-            &prepared.reconstructed_stacked_operator,
-            config.num_rbmc_probes,
-            config.rbmc_batch_count,
-            config.rng_seed.wrapping_add(0x1000),
-        )?,
+        decomposition_to_estimates(get_derived_decomposition(
+            &conditioning,
+            "reconstructed",
+            true,
+        )?),
         cell_count,
     )
     .map_err(invalid_data)?;
-    let surface_vector_prior_estimates = match config.surface_vector_variance_mode {
-        SurfaceVectorVarianceMode::Exact => exact_transformed_variances(
-            &mut prior_workspace,
-            &prepared.surface_vector_stacked_operator,
-        )?,
-        SurfaceVectorVarianceMode::Rbmc | SurfaceVectorVarianceMode::RbmcClipped => {
-            estimate_transformed_rbmc_variances(
-                &mut prior_workspace,
-                &prepared.surface_vector_stacked_operator,
-                config.num_rbmc_probes,
-                config.rbmc_batch_count,
-                config.rng_seed.wrapping_add(0x1800),
-            )?
-        }
-    };
-    let surface_vector_prior = split_ambient_estimates(surface_vector_prior_estimates, cell_count)
-        .map_err(invalid_data)?;
-    let smoothed_prior = split_component_estimates(
-        estimate_transformed_rbmc_variances(
-            &mut prior_workspace,
-            &prepared.smoothed_stacked_operator,
-            config.num_rbmc_probes,
-            config.rbmc_batch_count,
-            config.rng_seed.wrapping_add(0x2000),
-        )?,
-        cell_count,
-    )
-    .map_err(invalid_data)?;
-    let circulation_prior = estimate_transformed_rbmc_variances(
-        &mut prior_workspace,
-        &prepared.circulation_operator,
-        config.num_rbmc_probes,
-        config.rbmc_batch_count,
-        config.rng_seed.wrapping_add(0x3000),
-    )?;
-
     let reconstructed_posterior = split_component_estimates(
-        estimate_transformed_rbmc_variances(
-            &mut posterior_workspace,
-            &prepared.reconstructed_stacked_operator,
-            config.num_rbmc_probes,
-            config.rbmc_batch_count,
-            config.rng_seed.wrapping_add(0x1000),
-        )?,
+        decomposition_to_estimates(get_derived_decomposition(
+            &conditioning,
+            "reconstructed",
+            false,
+        )?),
         cell_count,
     )
     .map_err(invalid_data)?;
-    let surface_vector_posterior_estimates = match config.surface_vector_variance_mode {
-        SurfaceVectorVarianceMode::Exact => exact_transformed_variances(
-            &mut posterior_workspace,
-            &prepared.surface_vector_stacked_operator,
-        )?,
-        SurfaceVectorVarianceMode::Rbmc | SurfaceVectorVarianceMode::RbmcClipped => {
-            estimate_transformed_rbmc_variances(
-                &mut posterior_workspace,
-                &prepared.surface_vector_stacked_operator,
-                config.num_rbmc_probes,
-                config.rbmc_batch_count,
-                config.rng_seed.wrapping_add(0x1800),
-            )?
-        }
-    };
-    let surface_vector_posterior_raw =
-        split_ambient_estimates(surface_vector_posterior_estimates, cell_count)
-            .map_err(invalid_data)?;
+    let surface_vector_prior = split_ambient_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &conditioning,
+            "surface_vector",
+            true,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let surface_vector_posterior_raw = split_ambient_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &conditioning,
+            "surface_vector",
+            false,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
     let surface_vector_posterior =
         if config.surface_vector_variance_mode == SurfaceVectorVarianceMode::RbmcClipped {
             clip_rbmc_posterior_to_prior(&surface_vector_prior, &surface_vector_posterior_raw)
         } else {
             surface_vector_posterior_raw
         };
-    let smoothed_posterior = split_component_estimates(
-        estimate_transformed_rbmc_variances(
-            &mut posterior_workspace,
-            &prepared.smoothed_stacked_operator,
-            config.num_rbmc_probes,
-            config.rbmc_batch_count,
-            config.rng_seed.wrapping_add(0x2000),
-        )?,
+    let smoothed_prior = split_component_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &conditioning,
+            "smoothed",
+            true,
+        )?),
         cell_count,
     )
     .map_err(invalid_data)?;
-    let circulation_posterior = estimate_transformed_rbmc_variances(
-        &mut posterior_workspace,
-        &prepared.circulation_operator,
-        config.num_rbmc_probes,
-        config.rbmc_batch_count,
-        config.rng_seed.wrapping_add(0x3000),
-    )?;
+    let smoothed_posterior = split_component_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &conditioning,
+            "smoothed",
+            false,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let circulation_prior = decomposition_to_estimates(get_derived_decomposition(
+        &conditioning,
+        "circulation",
+        true,
+    )?);
+    let circulation_posterior = decomposition_to_estimates(get_derived_decomposition(
+        &conditioning,
+        "circulation",
+        false,
+    )?);
 
     assemble_torus_1form_pde_conditioning_result(
         prepared,
         config,
         posterior_mean,
-        &prior_latent_variances.unconstrained,
-        &posterior_latent_variances.unconstrained,
-        &prior_latent_variances.harmonic_free,
-        &posterior_latent_variances.harmonic_free,
+        &conditioning.prior_latent_variance.unconstrained_diag,
+        &conditioning.posterior_latent_variance.unconstrained_diag,
+        &conditioning.prior_latent_variance.constrained_diag,
+        &conditioning.posterior_latent_variance.constrained_diag,
         &reconstructed_prior,
         &reconstructed_posterior,
         &surface_vector_prior,
@@ -681,7 +594,7 @@ pub(crate) fn assemble_torus_1form_pde_conditioning_result(
     )
     .map_err(invalid_data)?;
 
-    let (u_exact, dif_solution_exact) = build_torus_convergence_fields();
+    let (u_exact, dif_solution_exact) = build_torus_reference_fields();
     let posterior_mean_cochain = Cochain::new(1, posterior_mean.clone());
     let posterior_dif = posterior_mean_cochain.dif(&prepared.topology);
     let l2_error = fe_l2_error(
@@ -752,6 +665,30 @@ pub(crate) fn assemble_torus_1form_pde_conditioning_result(
         posterior_relative_residual_norm: pde_residual.norm() / rhs_norm,
         variance_fields,
     })
+}
+
+fn get_derived_decomposition<'a>(
+    conditioning: &'a crate::linear_conditioning::LinearGaussianConditioningResult,
+    name: &str,
+    prior: bool,
+) -> Result<&'a TransformedVarianceDecomposition, Box<dyn Error>> {
+    let map = if prior {
+        &conditioning.derived_prior_variances
+    } else {
+        &conditioning.derived_posterior_variances
+    };
+    map.get(name).ok_or_else(|| {
+        invalid_data(format!("missing derived variance decomposition `{name}`")).into()
+    })
+}
+
+fn decomposition_to_estimates(
+    decomposition: &TransformedVarianceDecomposition,
+) -> RbmcVarianceEstimates {
+    RbmcVarianceEstimates {
+        unconstrained: decomposition.unconstrained_diag.clone(),
+        harmonic_free: decomposition.constrained_diag.clone(),
+    }
 }
 
 pub(crate) fn validate_config(
@@ -1005,9 +942,9 @@ fn transformed_rbmc_variances_batch(
     let mut variances = GmrfVector::zeros(output_dim);
     for _ in 0..num_samples {
         let probe = GmrfVector::from_fn(output_dim, |_| rng.sample(StandardNormal));
-        let rhs = operator.apply_transpose(&probe);
+        let rhs = operator.apply_transpose(&probe)?;
         let solved = gmrf.solve_precision(&rhs)?;
-        let projected = operator.apply(&solved);
+        let projected = operator.apply(&solved)?;
         variances += projected.component_mul(&probe);
     }
 
@@ -1398,7 +1335,7 @@ fn build_reconstructed_component_operator(
         rows.push(row);
     }
 
-    SparseRowLinearOperator::new(topology.skeleton(1).len(), rows)
+    SparseRowLinearOperator::new(topology.skeleton(1).len(), rows).map_err(|err| err.to_string())
 }
 
 fn build_embedded_component_operator(
@@ -1440,7 +1377,7 @@ fn build_embedded_component_operator(
         rows.push(row);
     }
 
-    SparseRowLinearOperator::new(topology.skeleton(1).len(), rows)
+    SparseRowLinearOperator::new(topology.skeleton(1).len(), rows).map_err(|err| err.to_string())
 }
 
 fn build_gaussian_smoothing_operator(
@@ -1489,7 +1426,7 @@ fn build_gaussian_smoothing_operator(
         rows.push(row);
     }
 
-    SparseRowLinearOperator::new(cell_geometry.theta.len(), rows)
+    SparseRowLinearOperator::new(cell_geometry.theta.len(), rows).map_err(|err| err.to_string())
 }
 
 fn build_local_circulation_operator(
@@ -1506,7 +1443,7 @@ fn build_local_circulation_operator(
             rows[cell_index].push((edge_index, *value));
         }
     }
-    SparseRowLinearOperator::new(edge_count, rows)
+    SparseRowLinearOperator::new(edge_count, rows).map_err(|err| err.to_string())
 }
 
 fn mass_orthonormalize_harmonic_basis(
@@ -2308,7 +2245,7 @@ pub fn run_torus_1form_pde_conditioning_kappa0(
         build_harmonic_orthogonality_constraints(&harmonic_basis, &hodge.mass_u)
             .map_err(invalid_data)?;
 
-    let (u_exact, _dif_solution_exact) = build_torus_convergence_fields();
+    let (u_exact, _dif_solution_exact) = build_torus_reference_fields();
     let truth_full = cochain_projection(&u_exact, &topology, &coords, None).coeffs;
     let truth = remove_harmonic_content(&truth_full, &harmonic_basis_orthonormal, &hodge.mass_u);
     let rhs = &system_matrix * &truth;
@@ -2327,13 +2264,13 @@ pub fn run_torus_1form_pde_conditioning_kappa0(
         build_embedded_component_operator(&topology, &coords, 2).map_err(invalid_data)?;
     let reconstructed_stacked_operator =
         SparseRowLinearOperator::stack(&[&toroidal_operator, &poloidal_operator])
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
     let surface_vector_stacked_operator = SparseRowLinearOperator::stack(&[
         &surface_x_operator,
         &surface_y_operator,
         &surface_z_operator,
     ])
-    .map_err(invalid_data)?;
+    .map_err(|err| invalid_data(err.to_string()))?;
     let circulation_operator =
         build_local_circulation_operator(&topology, hodge.mass_u.nrows()).map_err(invalid_data)?;
 
@@ -2633,9 +2570,9 @@ fn kappa0_transformed_rbmc_variances_batch(
     let mut variances = GmrfVector::zeros(output_dim);
     for _ in 0..num_samples {
         let probe = GmrfVector::from_fn(output_dim, |_| rng.sample(StandardNormal));
-        let rhs = operator.apply_transpose(&probe);
+        let rhs = operator.apply_transpose(&probe)?;
         let solved = solver.solve_covariance_action(&rhs)?;
-        let projected = operator.apply(&solved);
+        let projected = operator.apply(&solved)?;
         variances += projected.component_mul(&probe);
     }
 

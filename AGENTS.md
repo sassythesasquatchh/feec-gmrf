@@ -9,7 +9,7 @@ This repository is the **integration layer** between an existing FEEC library an
 - `crates/` — integration crates that live in this repo (currently `crates/feg-infer`).
 - `Cargo.toml` — top-level workspace for the integration crates only (it does **not** include the submodules’ workspaces).
 
-Agents should treat `feec/` and `gmrf/` as external submodules and avoid modifying them unless explicitly requested.
+Agents should treat `feec/` and `gmrf/` as external submodules but you are free to modify them to better encapsulate logic.
 
 This document defines the recommended **multi-repo structure**, crate boundaries, and dependency rules so development stays acyclic and each library keeps a clear responsibility.
 

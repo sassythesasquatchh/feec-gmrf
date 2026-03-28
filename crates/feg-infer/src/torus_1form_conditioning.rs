@@ -2,6 +2,10 @@ use crate::diagnostics::{
     build_analytic_torus_harmonic_basis, build_harmonic_orthogonality_constraints,
     infer_torus_radii,
 };
+use crate::linear_conditioning::{
+    DerivedOperator, DerivedOperatorSet, DerivedVarianceMode, HarmonicSubspace,
+    LinearGaussianConditioningProblem, LinearGaussianConditioningResult, RbmcConfig,
+};
 use crate::matern_1form::{
     build_hodge_laplacian_1form, build_matern_precision_1form, feec_csr_to_gmrf, feec_vec_to_gmrf,
     MaternConfig, MaternMassInverse,
@@ -24,7 +28,7 @@ use gmrf_core::observation::{
 use gmrf_core::types::{
     DenseMatrix as GmrfDenseMatrix, SparseMatrix as GmrfSparseMatrix, Vector as GmrfVector,
 };
-use gmrf_core::{Gmrf, GmrfError};
+use gmrf_core::{Gmrf, GmrfError, SparseRowOperator, TransformedVarianceDecomposition};
 use manifold::{
     geometry::coord::{
         mesh::MeshCoords,
@@ -409,11 +413,7 @@ struct RbmcWorkspace {
     constraint_correction: Option<ConstraintVarianceCorrection>,
 }
 
-#[derive(Clone)]
-struct SparseRowLinearOperator {
-    ncols: usize,
-    rows: Vec<Vec<(usize, f64)>>,
-}
+type SparseRowLinearOperator = SparseRowOperator;
 
 struct VariancePatternSharedData {
     major_radius: f64,
@@ -460,103 +460,6 @@ impl ObservationOrientationRelation {
     }
 }
 
-impl SparseRowLinearOperator {
-    fn new(ncols: usize, rows: Vec<Vec<(usize, f64)>>) -> Result<Self, String> {
-        if rows
-            .iter()
-            .flatten()
-            .any(|(col, value)| *col >= ncols || !value.is_finite())
-        {
-            return Err(
-                "sparse row operator contains invalid column indices or non-finite values"
-                    .to_string(),
-            );
-        }
-        Ok(Self { ncols, rows })
-    }
-
-    fn identity(size: usize) -> Self {
-        Self {
-            ncols: size,
-            rows: (0..size).map(|i| vec![(i, 1.0)]).collect(),
-        }
-    }
-
-    fn nrows(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn apply(&self, input: &GmrfVector) -> GmrfVector {
-        GmrfVector::from_iterator(
-            self.nrows(),
-            self.rows.iter().map(|row| {
-                row.iter()
-                    .map(|(col, value)| *value * input[*col])
-                    .sum::<f64>()
-            }),
-        )
-    }
-
-    fn apply_transpose(&self, input: &GmrfVector) -> GmrfVector {
-        let mut out = GmrfVector::zeros(self.ncols);
-        for (row_index, row) in self.rows.iter().enumerate() {
-            let weight = input[row_index];
-            if weight == 0.0 {
-                continue;
-            }
-            for (col, value) in row {
-                out[*col] += weight * *value;
-            }
-        }
-        out
-    }
-
-    fn stack(operators: &[&SparseRowLinearOperator]) -> Result<Self, String> {
-        let Some(first) = operators.first() else {
-            return Err("at least one operator is required for stacking".to_string());
-        };
-        let ncols = first.ncols;
-        if operators.iter().any(|operator| operator.ncols != ncols) {
-            return Err("all stacked operators must have the same column count".to_string());
-        }
-
-        let mut rows = Vec::new();
-        for operator in operators {
-            rows.extend(operator.rows.iter().cloned());
-        }
-        Ok(Self { ncols, rows })
-    }
-
-    fn compose(
-        left: &SparseRowLinearOperator,
-        right: &SparseRowLinearOperator,
-    ) -> Result<Self, String> {
-        if left.ncols != right.nrows() {
-            return Err("operator dimensions are incompatible for composition".to_string());
-        }
-
-        let mut rows = Vec::with_capacity(left.nrows());
-        for left_row in &left.rows {
-            let mut combined = BTreeMap::<usize, f64>::new();
-            for (intermediate, weight) in left_row {
-                for (col, value) in &right.rows[*intermediate] {
-                    *combined.entry(*col).or_insert(0.0) += *weight * *value;
-                }
-            }
-            let row = combined
-                .into_iter()
-                .filter_map(|(col, value)| (value.abs() > EPS).then_some((col, value)))
-                .collect::<Vec<_>>();
-            rows.push(row);
-        }
-
-        Ok(Self {
-            ncols: right.ncols,
-            rows,
-        })
-    }
-}
-
 pub fn run_torus_1form_conditioning(
     config: &Torus1FormConditioningConfig,
 ) -> Result<Torus1FormConditioningResult, Box<dyn Error>> {
@@ -581,8 +484,6 @@ pub fn run_torus_1form_conditioning(
     let harmonic_constraints =
         build_harmonic_orthogonality_constraints(&harmonic_basis, &hodge.mass_u)
             .map_err(invalid_data)?;
-    let constraint_rhs = GmrfVector::zeros(harmonic_constraints.nrows());
-
     let seed = build_local_seed_cochain(
         &topology,
         &coords,
@@ -627,14 +528,6 @@ pub fn run_torus_1form_conditioning(
         },
     );
     let q_prior = feec_csr_to_gmrf(&prior_precision);
-    let zero_observations = GmrfVector::zeros(observation_indices.len());
-    let (posterior_precision, _) = apply_gaussian_observations(
-        &q_prior,
-        &observation_matrix,
-        &zero_observations,
-        None,
-        config.noise_variance,
-    );
     let (_nu, _variance, effective_range) =
         convert_whittle_params_to_matern(2.0, config.tau, config.kappa, 2);
     let neighbourhood_radius = config.neighbourhood_radius_scale * effective_range;
@@ -656,149 +549,164 @@ pub fn run_torus_1form_conditioning(
         build_embedded_component_operator(&topology, &coords, 2).map_err(invalid_data)?;
     let reconstructed_stacked_operator =
         SparseRowLinearOperator::stack(&[&toroidal_operator, &poloidal_operator])
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
     let surface_vector_stacked_operator = SparseRowLinearOperator::stack(&[
         &surface_x_operator,
         &surface_y_operator,
         &surface_z_operator,
     ])
-    .map_err(invalid_data)?;
+    .map_err(|err| invalid_data(err.to_string()))?;
     let smoothing_operator =
         build_gaussian_smoothing_operator(&cell_geometry, smoothing_bandwidth, smoothing_cutoff)
             .map_err(invalid_data)?;
     let smoothed_toroidal_operator =
         SparseRowLinearOperator::compose(&smoothing_operator, &toroidal_operator)
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
     let smoothed_poloidal_operator =
         SparseRowLinearOperator::compose(&smoothing_operator, &poloidal_operator)
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
     let smoothed_stacked_operator =
         SparseRowLinearOperator::stack(&[&smoothed_toroidal_operator, &smoothed_poloidal_operator])
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
     let circulation_operator =
         build_local_circulation_operator(&topology, hodge.mass_u.nrows()).map_err(invalid_data)?;
 
-    let mut prior_workspace = build_rbmc_workspace(&q_prior, &harmonic_constraints)?;
-    let prior_latent_variances =
-        exact_latent_variances(&mut prior_workspace, &harmonic_constraints)?;
-    let reconstructed_prior = split_component_estimates(
-        estimate_transformed_rbmc_variances(
-            &mut prior_workspace,
-            &reconstructed_stacked_operator,
-            config.num_rbmc_probes,
-            config.rbmc_batch_count,
-            config.rng_seed.wrapping_add(0x1000),
-        )?,
-        cell_geometry.theta.len(),
-    )
-    .map_err(invalid_data)?;
-    let surface_vector_prior_estimates = match config.surface_vector_variance_mode {
-        SurfaceVectorVarianceMode::Exact => {
-            exact_transformed_variances(&mut prior_workspace, &surface_vector_stacked_operator)?
-        }
-        SurfaceVectorVarianceMode::Rbmc | SurfaceVectorVarianceMode::RbmcClipped => {
-            estimate_transformed_rbmc_variances(
-                &mut prior_workspace,
-                &surface_vector_stacked_operator,
-                config.num_rbmc_probes,
-                config.rbmc_batch_count,
-                config.rng_seed.wrapping_add(0x1800),
-            )?
-        }
-    };
-    let surface_vector_prior =
-        split_ambient_estimates(surface_vector_prior_estimates, cell_geometry.theta.len())
-            .map_err(invalid_data)?;
-    let smoothed_prior = split_component_estimates(
-        estimate_transformed_rbmc_variances(
-            &mut prior_workspace,
-            &smoothed_stacked_operator,
-            config.num_rbmc_probes,
-            config.rbmc_batch_count,
-            config.rng_seed.wrapping_add(0x2000),
-        )?,
-        cell_geometry.theta.len(),
-    )
-    .map_err(invalid_data)?;
-    let circulation_prior = estimate_transformed_rbmc_variances(
-        &mut prior_workspace,
-        &circulation_operator,
-        config.num_rbmc_probes,
-        config.rbmc_batch_count,
-        config.rng_seed.wrapping_add(0x3000),
-    )?;
+    let mut derived_operators = DerivedOperatorSet::new();
+    derived_operators.insert(
+        "reconstructed".to_string(),
+        DerivedOperator {
+            operator: reconstructed_stacked_operator.clone(),
+            variance_mode: DerivedVarianceMode::Rbmc,
+        },
+    );
+    derived_operators.insert(
+        "surface_vector".to_string(),
+        DerivedOperator {
+            operator: surface_vector_stacked_operator.clone(),
+            variance_mode: match config.surface_vector_variance_mode {
+                SurfaceVectorVarianceMode::Exact => DerivedVarianceMode::Exact,
+                SurfaceVectorVarianceMode::Rbmc | SurfaceVectorVarianceMode::RbmcClipped => {
+                    DerivedVarianceMode::Rbmc
+                }
+            },
+        },
+    );
+    derived_operators.insert(
+        "smoothed".to_string(),
+        DerivedOperator {
+            operator: smoothed_stacked_operator.clone(),
+            variance_mode: DerivedVarianceMode::Rbmc,
+        },
+    );
+    derived_operators.insert(
+        "circulation".to_string(),
+        DerivedOperator {
+            operator: circulation_operator.clone(),
+            variance_mode: DerivedVarianceMode::Rbmc,
+        },
+    );
 
-    let mut posterior_workspace =
-        build_rbmc_workspace(&posterior_precision, &harmonic_constraints)?;
-    let posterior_latent_variances =
-        exact_latent_variances(&mut posterior_workspace, &harmonic_constraints)?;
-    let reconstructed_posterior = split_component_estimates(
-        estimate_transformed_rbmc_variances(
-            &mut posterior_workspace,
-            &reconstructed_stacked_operator,
-            config.num_rbmc_probes,
-            config.rbmc_batch_count,
-            config.rng_seed.wrapping_add(0x1000),
-        )?,
-        cell_geometry.theta.len(),
-    )
-    .map_err(invalid_data)?;
-    let surface_vector_posterior_estimates = match config.surface_vector_variance_mode {
-        SurfaceVectorVarianceMode::Exact => {
-            exact_transformed_variances(&mut posterior_workspace, &surface_vector_stacked_operator)?
-        }
-        SurfaceVectorVarianceMode::Rbmc | SurfaceVectorVarianceMode::RbmcClipped => {
-            estimate_transformed_rbmc_variances(
-                &mut posterior_workspace,
-                &surface_vector_stacked_operator,
-                config.num_rbmc_probes,
-                config.rbmc_batch_count,
-                config.rng_seed.wrapping_add(0x1800),
-            )?
-        }
+    let conditioning_problem = LinearGaussianConditioningProblem {
+        prior_precision: q_prior.clone(),
+        observation_operator: observation_matrix.clone(),
+        observations: GmrfVector::zeros(observation_indices.len()),
+        noise_variance: config.noise_variance,
+        harmonic_subspace: Some(HarmonicSubspace {
+            basis: harmonic_basis_orthonormal.clone(),
+            constraints: harmonic_constraints.clone(),
+            projector: None,
+        }),
+        derived_operators,
+        rbmc: RbmcConfig {
+            num_probes: config.num_rbmc_probes,
+            batch_count: config.rbmc_batch_count,
+            rng_seed: config.rng_seed,
+        },
     };
-    let surface_vector_posterior_estimates =
-        if config.surface_vector_variance_mode == SurfaceVectorVarianceMode::RbmcClipped {
-            clip_rbmc_posterior_to_prior(
-                &surface_vector_prior,
-                &split_ambient_estimates(
-                    surface_vector_posterior_estimates,
-                    cell_geometry.theta.len(),
-                )
-                .map_err(invalid_data)?,
-            )
-        } else {
-            split_ambient_estimates(
-                surface_vector_posterior_estimates,
-                cell_geometry.theta.len(),
-            )
-            .map_err(invalid_data)?
-        };
-    let surface_vector_posterior = surface_vector_posterior_estimates;
-    let smoothed_posterior = split_component_estimates(
-        estimate_transformed_rbmc_variances(
-            &mut posterior_workspace,
-            &smoothed_stacked_operator,
-            config.num_rbmc_probes,
-            config.rbmc_batch_count,
-            config.rng_seed.wrapping_add(0x2000),
-        )?,
-        cell_geometry.theta.len(),
+    let prepared_conditioning = conditioning_problem.prepare()?;
+
+    let truth_harmonic_free_gmrf = feec_vec_to_gmrf(&truth_harmonic_free);
+    let harmonic_free_observations = &observation_matrix * &truth_harmonic_free_gmrf;
+    let harmonic_free_conditioning =
+        prepared_conditioning.solve_with_observations(&harmonic_free_observations)?;
+
+    let truth_full_gmrf = feec_vec_to_gmrf(&truth_full);
+    let full_observations = &observation_matrix * &truth_full_gmrf;
+    let full_conditioning = prepared_conditioning.solve_with_observations(&full_observations)?;
+
+    let cell_count = cell_geometry.theta.len();
+    let reconstructed_prior = split_component_estimates(
+        decomposition_to_estimates(
+            get_derived_decomposition(&harmonic_free_conditioning, "reconstructed", true)?,
+        ),
+        cell_count,
     )
     .map_err(invalid_data)?;
-    let circulation_posterior = estimate_transformed_rbmc_variances(
-        &mut posterior_workspace,
-        &circulation_operator,
-        config.num_rbmc_probes,
-        config.rbmc_batch_count,
-        config.rng_seed.wrapping_add(0x3000),
-    )?;
+    let reconstructed_posterior = split_component_estimates(
+        decomposition_to_estimates(
+            get_derived_decomposition(&harmonic_free_conditioning, "reconstructed", false)?,
+        ),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let surface_vector_prior = split_ambient_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &harmonic_free_conditioning,
+            "surface_vector",
+            true,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let surface_vector_posterior_raw = split_ambient_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &harmonic_free_conditioning,
+            "surface_vector",
+            false,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let surface_vector_posterior =
+        if config.surface_vector_variance_mode == SurfaceVectorVarianceMode::RbmcClipped {
+            clip_rbmc_posterior_to_prior(&surface_vector_prior, &surface_vector_posterior_raw)
+        } else {
+            surface_vector_posterior_raw
+        };
+    let smoothed_prior = split_component_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &harmonic_free_conditioning,
+            "smoothed",
+            true,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let smoothed_posterior = split_component_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &harmonic_free_conditioning,
+            "smoothed",
+            false,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let circulation_prior = decomposition_to_estimates(get_derived_decomposition(
+        &harmonic_free_conditioning,
+        "circulation",
+        true,
+    )?);
+    let circulation_posterior = decomposition_to_estimates(get_derived_decomposition(
+        &harmonic_free_conditioning,
+        "circulation",
+        false,
+    )?);
 
     let variance_pattern_shared = VariancePatternSharedData {
         major_radius: geometry.major_radius,
         minor_radius: geometry.minor_radius,
-        cell_theta: FeecVector::from_vec(cell_geometry.theta),
-        cell_phi: FeecVector::from_vec(cell_geometry.phi),
+        cell_theta: FeecVector::from_vec(cell_geometry.theta.clone()),
+        cell_phi: FeecVector::from_vec(cell_geometry.phi.clone()),
         smoothing_bandwidth,
         smoothing_cutoff,
         reconstructed_prior,
@@ -814,13 +722,7 @@ pub fn run_torus_1form_conditioning(
     let harmonic_free_constrained = build_branch_result(
         "harmonic_free_constrained",
         &truth_harmonic_free,
-        &posterior_precision,
-        &observation_matrix,
-        config.noise_variance,
-        &harmonic_constraints,
-        &constraint_rhs,
-        &prior_latent_variances,
-        &posterior_latent_variances,
+        &harmonic_free_conditioning,
         true,
         &edge_theta,
         &edge_phi,
@@ -840,13 +742,7 @@ pub fn run_torus_1form_conditioning(
     let full_unconstrained = build_branch_result(
         "full_unconstrained",
         &truth_full,
-        &posterior_precision,
-        &observation_matrix,
-        config.noise_variance,
-        &harmonic_constraints,
-        &constraint_rhs,
-        &prior_latent_variances,
-        &posterior_latent_variances,
+        &full_conditioning,
         false,
         &edge_theta,
         &edge_phi,
@@ -905,13 +801,7 @@ pub fn write_torus_1form_conditioning_outputs(
 fn build_branch_result(
     name: &'static str,
     truth: &FeecVector,
-    posterior_precision: &GmrfSparseMatrix,
-    observation_matrix: &GmrfSparseMatrix,
-    noise_variance: f64,
-    harmonic_constraints: &GmrfDenseMatrix,
-    constraint_rhs: &GmrfVector,
-    prior_variances: &RbmcVarianceEstimates,
-    posterior_variances: &RbmcVarianceEstimates,
+    conditioning: &LinearGaussianConditioningResult,
     enforce_harmonic_constraints: bool,
     edge_theta: &FeecVector,
     edge_phi: &FeecVector,
@@ -927,36 +817,32 @@ fn build_branch_result(
     neighbourhood_radius: f64,
     far_radius: f64,
 ) -> Result<Torus1FormBranchResult, Box<dyn Error>> {
-    let truth_gmrf = feec_vec_to_gmrf(truth);
-    let observation_values = (&*observation_matrix * &truth_gmrf)
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
-    let information = ht_weighted_observations(
-        observation_matrix,
-        &GmrfVector::from_vec(observation_values.clone()),
-        1.0 / noise_variance,
-    );
-
-    let mut posterior =
-        Gmrf::from_information_and_precision(information, posterior_precision.clone())?;
     let posterior_mean = if enforce_harmonic_constraints {
-        constrained_mean(&mut posterior, harmonic_constraints, constraint_rhs)?
+        conditioning
+            .constrained_posterior_mean
+            .as_ref()
+            .ok_or_else(|| invalid_data("missing constrained posterior mean"))?
+            .clone()
     } else {
-        posterior.mean().clone()
+        conditioning.posterior_mean.clone()
     };
     let posterior_variance = if enforce_harmonic_constraints {
-        gmrf_vec_to_feec(&posterior_variances.harmonic_free)
+        gmrf_vec_to_feec(&conditioning.posterior_latent_variance.constrained_diag)
     } else {
-        gmrf_vec_to_feec(&posterior_variances.unconstrained)
+        gmrf_vec_to_feec(&conditioning.posterior_latent_variance.unconstrained_diag)
     };
     let prior_variance = if enforce_harmonic_constraints {
-        gmrf_vec_to_feec(&prior_variances.harmonic_free)
+        gmrf_vec_to_feec(&conditioning.prior_latent_variance.constrained_diag)
     } else {
-        gmrf_vec_to_feec(&prior_variances.unconstrained)
+        gmrf_vec_to_feec(&conditioning.prior_latent_variance.unconstrained_diag)
     };
 
     let posterior_mean = gmrf_vec_to_feec(&posterior_mean);
+    let observation_values = conditioning
+        .observations
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
     let absolute_mean_error = absolute_difference(&posterior_mean, truth);
     let variance_reduction = &prior_variance - &posterior_variance;
 
@@ -965,8 +851,10 @@ fn build_branch_result(
         remove_harmonic_content(&posterior_mean, harmonic_basis_orthonormal, mass_u);
     let harmonic_free_absolute_mean_error =
         absolute_difference(&harmonic_free_posterior_mean, &harmonic_free_truth);
-    let harmonic_free_prior_variance = gmrf_vec_to_feec(&prior_variances.harmonic_free);
-    let harmonic_free_posterior_variance = gmrf_vec_to_feec(&posterior_variances.harmonic_free);
+    let harmonic_free_prior_variance =
+        gmrf_vec_to_feec(&conditioning.prior_latent_variance.constrained_diag);
+    let harmonic_free_posterior_variance =
+        gmrf_vec_to_feec(&conditioning.posterior_latent_variance.constrained_diag);
     let harmonic_free_variance_reduction =
         &harmonic_free_prior_variance - &harmonic_free_posterior_variance;
 
@@ -1041,6 +929,30 @@ fn build_branch_result(
         summary,
         variance_pattern,
     })
+}
+
+fn get_derived_decomposition<'a>(
+    conditioning: &'a LinearGaussianConditioningResult,
+    name: &str,
+    prior: bool,
+) -> Result<&'a TransformedVarianceDecomposition, Box<dyn Error>> {
+    let map = if prior {
+        &conditioning.derived_prior_variances
+    } else {
+        &conditioning.derived_posterior_variances
+    };
+    map.get(name).ok_or_else(|| {
+        invalid_data(format!("missing derived variance decomposition `{name}`")).into()
+    })
+}
+
+fn decomposition_to_estimates(
+    decomposition: &TransformedVarianceDecomposition,
+) -> RbmcVarianceEstimates {
+    RbmcVarianceEstimates {
+        unconstrained: decomposition.unconstrained_diag.clone(),
+        harmonic_free: decomposition.constrained_diag.clone(),
+    }
 }
 
 fn validate_config(config: &Torus1FormConditioningConfig) -> Result<(), Box<dyn Error>> {
@@ -1269,9 +1181,9 @@ fn transformed_rbmc_variances_batch(
     let mut variances = GmrfVector::zeros(output_dim);
     for _ in 0..num_samples {
         let probe = GmrfVector::from_fn(output_dim, |_| rng.sample(StandardNormal));
-        let rhs = operator.apply_transpose(&probe);
+        let rhs = operator.apply_transpose(&probe)?;
         let solved = gmrf.solve_precision(&rhs)?;
-        let projected = operator.apply(&solved);
+        let projected = operator.apply(&solved)?;
         variances += projected.component_mul(&probe);
     }
 
@@ -1676,7 +1588,7 @@ fn build_reconstructed_component_operator(
         rows.push(row);
     }
 
-    SparseRowLinearOperator::new(topology.skeleton(1).len(), rows)
+    SparseRowLinearOperator::new(topology.skeleton(1).len(), rows).map_err(|err| err.to_string())
 }
 
 fn build_embedded_component_operator(
@@ -1718,7 +1630,7 @@ fn build_embedded_component_operator(
         rows.push(row);
     }
 
-    SparseRowLinearOperator::new(topology.skeleton(1).len(), rows)
+    SparseRowLinearOperator::new(topology.skeleton(1).len(), rows).map_err(|err| err.to_string())
 }
 
 fn build_gaussian_smoothing_operator(
@@ -1767,7 +1679,7 @@ fn build_gaussian_smoothing_operator(
         rows.push(row);
     }
 
-    SparseRowLinearOperator::new(cell_geometry.theta.len(), rows)
+    SparseRowLinearOperator::new(cell_geometry.theta.len(), rows).map_err(|err| err.to_string())
 }
 
 fn build_local_circulation_operator(
@@ -1784,7 +1696,7 @@ fn build_local_circulation_operator(
             rows[cell_index].push((edge_index, *value));
         }
     }
-    SparseRowLinearOperator::new(edge_count, rows)
+    SparseRowLinearOperator::new(edge_count, rows).map_err(|err| err.to_string())
 }
 
 fn build_local_seed_cochain(
@@ -2937,40 +2849,6 @@ fn pearson_correlation(xs: &[f64], ys: &[f64]) -> f64 {
     } else {
         cov / (var_x.sqrt() * var_y.sqrt())
     }
-}
-
-fn constrained_mean(
-    posterior: &mut Gmrf,
-    constraint_matrix: &GmrfDenseMatrix,
-    constraint_rhs: &GmrfVector,
-) -> Result<GmrfVector, GmrfError> {
-    if constraint_matrix.ncols() != posterior.dimension() {
-        return Err(GmrfError::DimensionMismatch(
-            "constraint matrix columns must match latent dimension",
-        ));
-    }
-    if constraint_matrix.nrows() != constraint_rhs.len() {
-        return Err(GmrfError::DimensionMismatch(
-            "constraint rhs length must match constraint matrix rows",
-        ));
-    }
-    if constraint_matrix.nrows() == 0 {
-        return Ok(posterior.mean().clone());
-    }
-
-    let covariance_times_constraint_t =
-        covariance_times_constraint_t(posterior, constraint_matrix)?;
-    let predicted_constraints = dense_matvec(constraint_matrix, posterior.mean());
-    let mut lagrange_rhs = constraint_rhs - &predicted_constraints;
-
-    let schur = schur_complement(constraint_matrix, &covariance_times_constraint_t);
-    let schur_factor = schur
-        .llt(Side::Lower)
-        .map_err(|_| GmrfError::SingularConstraintSystem)?;
-    schur_factor.solve_in_place(lagrange_rhs.as_col_mut().as_mat_mut());
-
-    let correction = dense_matvec(&covariance_times_constraint_t, &lagrange_rhs);
-    Ok(posterior.mean() + correction)
 }
 
 fn covariance_times_constraint_t(
@@ -4355,13 +4233,13 @@ pub fn run_torus_1form_conditioning_kappa0(
         build_embedded_component_operator(&topology, &coords, 2).map_err(invalid_data)?;
     let reconstructed_stacked_operator =
         SparseRowLinearOperator::stack(&[&toroidal_operator, &poloidal_operator])
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
     let surface_vector_stacked_operator = SparseRowLinearOperator::stack(&[
         &surface_x_operator,
         &surface_y_operator,
         &surface_z_operator,
     ])
-    .map_err(invalid_data)?;
+    .map_err(|err| invalid_data(err.to_string()))?;
     let circulation_operator =
         build_local_circulation_operator(&topology, hodge.mass_u.nrows()).map_err(invalid_data)?;
 
@@ -4688,9 +4566,9 @@ fn kappa0_transformed_rbmc_variances_batch(
     let mut variances = GmrfVector::zeros(output_dim);
     for _ in 0..num_samples {
         let probe = GmrfVector::from_fn(output_dim, |_| rng.sample(StandardNormal));
-        let rhs = operator.apply_transpose(&probe);
+        let rhs = operator.apply_transpose(&probe)?;
         let solved = solver.solve_covariance_action(&rhs)?;
-        let projected = operator.apply(&solved);
+        let projected = operator.apply(&solved)?;
         variances += projected.component_mul(&probe);
     }
 

@@ -22,6 +22,8 @@ use crate::torus_1form_pde_conditioning::{
     clip_rbmc_posterior_to_prior, default_torus_shell_resolution_1_mesh_path,
     estimate_transformed_rbmc_variances, exact_transformed_variances, invalid_data,
     prepare_torus_1form_pde_problem, run_prepared_torus_1form_pde_conditioning,
+    sparse_row_operator_apply_feec, sparse_row_operator_from_feec_dense,
+    sparse_row_operator_from_feec_sparse,
     split_ambient_estimates, split_component_estimates, validate_config,
     write_torus_1form_pde_conditioning_outputs, PreparedTorus1FormPdeProblem,
     SparseRowLinearOperator, Torus1FormAmbientVarianceEstimates, Torus1FormPdeConditioningConfig,
@@ -211,7 +213,7 @@ fn run_sparse_branch(
     d1: &FeecCsr,
 ) -> Result<Torus1FormPdeHodgeBranchResult, Box<dyn Error>> {
     let ambient_operator =
-        SparseRowLinearOperator::from_sparse_matrix(ambient_transform).map_err(invalid_data)?;
+        sparse_row_operator_from_feec_sparse(ambient_transform).map_err(invalid_data)?;
     let latent_observation_matrix = &prepared.system_matrix * ambient_transform;
     run_branch(
         kind,
@@ -237,7 +239,7 @@ fn run_dense_branch(
     d1: &FeecCsr,
 ) -> Result<Torus1FormPdeHodgeBranchResult, Box<dyn Error>> {
     let ambient_operator =
-        SparseRowLinearOperator::from_dense_matrix(ambient_transform, 0.0).map_err(invalid_data)?;
+        sparse_row_operator_from_feec_dense(ambient_transform, 0.0).map_err(invalid_data)?;
     let latent_observation_dense = feec_csr_to_dense(&prepared.system_matrix) * ambient_transform;
     let latent_observation_matrix = dense_to_feec_csr(&latent_observation_dense, 0.0);
     run_branch(
@@ -271,23 +273,23 @@ fn run_branch(
 
     let harmonic_free_operator =
         SparseRowLinearOperator::compose(harmonic_free_projection, ambient_operator)
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
     let reconstructed_operator = SparseRowLinearOperator::compose(
         &prepared.reconstructed_stacked_operator,
         ambient_operator,
     )
-    .map_err(invalid_data)?;
+    .map_err(|err| invalid_data(err.to_string()))?;
     let surface_vector_operator = SparseRowLinearOperator::compose(
         &prepared.surface_vector_stacked_operator,
         ambient_operator,
     )
-    .map_err(invalid_data)?;
+    .map_err(|err| invalid_data(err.to_string()))?;
     let smoothed_operator =
         SparseRowLinearOperator::compose(&prepared.smoothed_stacked_operator, ambient_operator)
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
     let circulation_operator =
         SparseRowLinearOperator::compose(&prepared.circulation_operator, ambient_operator)
-            .map_err(invalid_data)?;
+            .map_err(|err| invalid_data(err.to_string()))?;
 
     let prior_precision = feec_csr_to_gmrf(latent_precision);
     let observations = feec_vec_to_gmrf(&prepared.rhs);
@@ -341,9 +343,9 @@ fn run_branch(
     );
     let posterior = Gmrf::from_information_and_precision(information, posterior_precision.clone())?;
     let latent_posterior_mean = gmrf_vec_to_feec(posterior.mean());
-    let posterior_mean = ambient_operator
-        .apply_feec(&latent_posterior_mean)
-        .map_err(invalid_data)?;
+    let posterior_mean =
+        sparse_row_operator_apply_feec(ambient_operator, &latent_posterior_mean)
+            .map_err(invalid_data)?;
 
     let mut posterior_workspace = build_rbmc_workspace(&posterior_precision, &empty_constraints)?;
     let posterior_variance =
@@ -458,7 +460,7 @@ fn build_harmonic_free_projection_operator(
 ) -> Result<SparseRowLinearOperator, Box<dyn Error>> {
     let dim = prepared.hodge.mass_u.nrows();
     if prepared.harmonic_basis_orthonormal.ncols() == 0 {
-        return SparseRowLinearOperator::from_dense_matrix(&FeecMatrix::identity(dim, dim), 0.0)
+        return sparse_row_operator_from_feec_dense(&FeecMatrix::identity(dim, dim), 0.0)
             .map_err(|err| invalid_data(err).into());
     }
 
@@ -466,7 +468,7 @@ fn build_harmonic_free_projection_operator(
     let projector = FeecMatrix::identity(dim, dim)
         - &prepared.harmonic_basis_orthonormal
             * (prepared.harmonic_basis_orthonormal.transpose() * mass_dense);
-    SparseRowLinearOperator::from_dense_matrix(&projector, 0.0)
+    sparse_row_operator_from_feec_dense(&projector, 0.0)
         .map_err(|err| invalid_data(err).into())
 }
 

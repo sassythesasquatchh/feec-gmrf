@@ -1,6 +1,7 @@
 use common::linalg::nalgebra::{
     CooMatrix as FeecCoo, CsrMatrix as FeecCsr, Matrix as FeecMatrix, Vector as FeecVector,
 };
+use feg_core::{FixedDof, SparseTripletMatrix, StateLayout};
 use gmrf_core::types::{CooMatrix as GmrfCoo, SparseMatrix as GmrfSparse, Vector as GmrfVector};
 
 pub fn feec_csr_to_gmrf(mat: &FeecCsr) -> GmrfSparse {
@@ -17,6 +18,46 @@ pub fn feec_vec_to_gmrf(vec: &FeecVector) -> GmrfVector {
 
 pub fn gmrf_vec_to_feec(vec: &GmrfVector) -> FeecVector {
     FeecVector::from_vec(vec.iter().copied().collect())
+}
+
+pub fn core_triplet_to_feec_csr(matrix: &SparseTripletMatrix) -> FeecCsr {
+    let mut coo = FeecCoo::new(matrix.nrows(), matrix.ncols());
+    for (row, col, value) in matrix.triplet_iter() {
+        coo.push(row, col, value);
+    }
+    FeecCsr::from(&coo)
+}
+
+pub fn reduce_vector_with_layout(layout: &StateLayout, full: &FeecVector) -> Result<FeecVector, String> {
+    if full.len() != layout.full_dimension {
+        return Err(format!(
+            "full vector length {} does not match layout dimension {}",
+            full.len(),
+            layout.full_dimension
+        ));
+    }
+    Ok(FeecVector::from_iterator(
+        layout.reduced_dimension(),
+        layout.active_dofs.iter().map(|&index| full[index]),
+    ))
+}
+
+pub fn lift_vector_with_layout(layout: &StateLayout, reduced: &FeecVector) -> Result<FeecVector, String> {
+    if reduced.len() != layout.reduced_dimension() {
+        return Err(format!(
+            "reduced vector length {} does not match layout reduced dimension {}",
+            reduced.len(),
+            layout.reduced_dimension()
+        ));
+    }
+    let mut full = FeecVector::zeros(layout.full_dimension);
+    for (reduced_index, full_index) in layout.active_dofs.iter().copied().enumerate() {
+        full[full_index] = reduced[reduced_index];
+    }
+    for FixedDof { index, value } in &layout.fixed_dofs {
+        full[*index] = *value;
+    }
+    Ok(full)
 }
 
 pub fn feec_csr_to_dense(mat: &FeecCsr) -> FeecMatrix {

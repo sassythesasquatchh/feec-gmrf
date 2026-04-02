@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+feg-core = { path = "../feg-core" }
 formoniq = { path = "../../feec/crates/formoniq" }
 manifold = { path = "../../feec/crates/manifold" }
 common = { path = "../../feec/crates/common" }

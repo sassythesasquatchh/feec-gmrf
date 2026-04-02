@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/feg-core",
   "crates/feg-infer",
   "crates/feg-gp",
 ]

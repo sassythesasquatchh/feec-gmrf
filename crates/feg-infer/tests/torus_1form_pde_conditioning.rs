@@ -55,6 +55,7 @@ fn torus_1form_pde_conditioning_builds_and_is_finite() {
         .ratio
         .iter()
         .all(|value| value.is_finite()));
+    assert!(result.posterior_deterministic_l2_error.is_finite());
     assert!(result.l2_error.is_finite());
     assert!(result.hd_error.is_finite());
 }
@@ -128,6 +129,10 @@ fn torus_1form_pde_conditioning_writes_expected_outputs() {
             relative
         );
     }
+
+    let summary = fs::read_to_string(out_dir.join("summary.txt"))
+        .expect("summary file should be readable as text");
+    assert!(summary.contains("posterior_deterministic_l2_error="));
 
     let _ = fs::remove_dir_all(&out_dir);
 }

@@ -25,7 +25,7 @@ use ddf::whitney::lsf::WhitneyLsf;
 use exterior::{field::EmbeddedDiffFormClosure, field::ExteriorField, ExteriorElement};
 use faer::linalg::solvers::Solve;
 use faer::Side;
-use formoniq::fe::fe_l2_error;
+use formoniq::fe::{fe_l2_error, l2_norm};
 use formoniq::io::{sample_1form_cell_vectors, write_top_cell_vtk_fields};
 use formoniq::torus_convergence::build_torus_reference_fields;
 use gmrf_core::observation::apply_gaussian_observations;
@@ -129,6 +129,7 @@ pub struct Torus1FormPdeConditioningResult {
     pub harmonic_free_variance_ratio: FeecVector,
     pub harmonic_coefficients_truth: [f64; 2],
     pub harmonic_coefficients_posterior_mean: [f64; 2],
+    pub posterior_deterministic_l2_error: f64,
     pub l2_error: f64,
     pub hd_error: f64,
     pub truth_residual_norm: f64,
@@ -386,7 +387,7 @@ pub(crate) fn run_prepared_torus_1form_pde_conditioning(
         MaternConfig {
             kappa: config.kappa,
             tau: config.tau,
-            mass_inverse: MaternMassInverse::RowSumLumped,
+            mass_inverse: MaternMassInverse::Nc1ProjectedSparseInverse,
         },
     );
     let q_prior = feec_csr_to_gmrf(&prior_precision);
@@ -489,20 +490,12 @@ pub(crate) fn run_prepared_torus_1form_pde_conditioning(
             surface_vector_posterior_raw
         };
     let smoothed_prior = split_component_estimates(
-        decomposition_to_estimates(get_derived_decomposition(
-            &conditioning,
-            "smoothed",
-            true,
-        )?),
+        decomposition_to_estimates(get_derived_decomposition(&conditioning, "smoothed", true)?),
         cell_count,
     )
     .map_err(invalid_data)?;
     let smoothed_posterior = split_component_estimates(
-        decomposition_to_estimates(get_derived_decomposition(
-            &conditioning,
-            "smoothed",
-            false,
-        )?),
+        decomposition_to_estimates(get_derived_decomposition(&conditioning, "smoothed", false)?),
         cell_count,
     )
     .map_err(invalid_data)?;
@@ -597,6 +590,12 @@ pub(crate) fn assemble_torus_1form_pde_conditioning_result(
     let (u_exact, dif_solution_exact) = build_torus_reference_fields();
     let posterior_mean_cochain = Cochain::new(1, posterior_mean.clone());
     let posterior_dif = posterior_mean_cochain.dif(&prepared.topology);
+    let deterministic_solution = Cochain::new(1, prepared.truth.clone());
+    let posterior_deterministic_l2_error = l2_norm(
+        &(posterior_mean_cochain.clone() - deterministic_solution),
+        &prepared.topology,
+        &prepared.metric,
+    );
     let l2_error = fe_l2_error(
         &posterior_mean_cochain,
         &u_exact,
@@ -657,6 +656,7 @@ pub(crate) fn assemble_torus_1form_pde_conditioning_result(
         harmonic_free_variance_ratio,
         harmonic_coefficients_truth,
         harmonic_coefficients_posterior_mean,
+        posterior_deterministic_l2_error,
         l2_error,
         hd_error,
         truth_residual_norm: truth_residual.norm(),
@@ -1731,6 +1731,11 @@ fn write_overall_summary(
         result.harmonic_coefficients_posterior_mean[0],
         result.harmonic_coefficients_posterior_mean[1]
     )?;
+    writeln!(
+        writer,
+        "posterior_deterministic_l2_error={}",
+        result.posterior_deterministic_l2_error
+    )?;
     writeln!(writer, "l2_error={}", result.l2_error)?;
     writeln!(writer, "hd_error={}", result.hd_error)?;
     writeln!(writer, "truth_residual_norm={}", result.truth_residual_norm)?;
@@ -2211,6 +2216,7 @@ pub struct Torus1FormPdeConditioningKappa0Result {
     pub variance_ratio: FeecVector,
     pub harmonic_coefficients_truth: [f64; 2],
     pub harmonic_coefficients_posterior_mean: [f64; 2],
+    pub posterior_deterministic_l2_error: f64,
     pub truth_residual_norm: f64,
     pub truth_relative_residual_norm: f64,
     pub posterior_residual_norm: f64,
@@ -2281,7 +2287,7 @@ pub fn run_torus_1form_pde_conditioning_kappa0(
         MaternConfig {
             kappa: 0.0,
             tau: config.tau,
-            mass_inverse: MaternMassInverse::RowSumLumped,
+            mass_inverse: MaternMassInverse::Nc1ProjectedSparseInverse,
         },
     );
     let q_prior = feec_csr_to_gmrf(&prior_precision);
@@ -2415,6 +2421,13 @@ pub fn run_torus_1form_pde_conditioning_kappa0(
     let harmonic_coefficients_posterior_mean =
         harmonic_coefficients(&posterior_mean, &harmonic_basis_orthonormal, &hodge.mass_u)
             .map_err(invalid_data)?;
+    let posterior_mean_cochain = Cochain::new(1, posterior_mean.clone());
+    let deterministic_solution = Cochain::new(1, truth.clone());
+    let posterior_deterministic_l2_error = l2_norm(
+        &(posterior_mean_cochain - deterministic_solution),
+        &topology,
+        &metric,
+    );
     let rhs_norm = rhs.norm().max(EPS);
 
     Ok(Torus1FormPdeConditioningKappa0Result {
@@ -2441,6 +2454,7 @@ pub fn run_torus_1form_pde_conditioning_kappa0(
         variance_ratio,
         harmonic_coefficients_truth,
         harmonic_coefficients_posterior_mean,
+        posterior_deterministic_l2_error,
         truth_residual_norm: 0.0,
         truth_relative_residual_norm: 0.0,
         posterior_residual_norm: pde_residual.norm(),
@@ -2609,6 +2623,11 @@ fn write_kappa0_pde_summary(
         "harmonic_coefficients_posterior_mean={},{}",
         result.harmonic_coefficients_posterior_mean[0],
         result.harmonic_coefficients_posterior_mean[1]
+    )?;
+    writeln!(
+        writer,
+        "posterior_deterministic_l2_error={}",
+        result.posterior_deterministic_l2_error
     )?;
     writeln!(writer, "truth_residual_norm={}", result.truth_residual_norm)?;
     writeln!(

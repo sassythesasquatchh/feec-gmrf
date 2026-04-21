@@ -191,6 +191,179 @@ pub struct SoftBoundaryConstraint {
     pub variance: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepresentationPreference {
+    Auto,
+    ForceCollapsed,
+    ForceLatent,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GaussianPriorSpec {
+    pub mean: Vec<f64>,
+    pub precision: SparseTripletMatrix,
+}
+
+impl GaussianPriorSpec {
+    pub fn dimension(&self) -> usize {
+        self.precision.nrows()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.precision.nrows() != self.precision.ncols() {
+            return Err("Gaussian prior precision must be square".to_string());
+        }
+        if self.mean.len() != self.precision.nrows() {
+            return Err(format!(
+                "Gaussian prior mean length {} must match precision dimension {}",
+                self.mean.len(),
+                self.precision.nrows()
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearUncertainInputSpec {
+    pub name: String,
+    pub operator: SparseTripletMatrix,
+    pub prior: GaussianPriorSpec,
+    pub preference: RepresentationPreference,
+    pub collapsed_precision: Option<SparseTripletMatrix>,
+}
+
+impl LinearUncertainInputSpec {
+    pub fn validate(&self, residual_dimension: usize) -> Result<(), String> {
+        self.prior.validate()?;
+        if self.operator.nrows() != residual_dimension {
+            return Err(format!(
+                "uncertain input `{}` operator row count {} must match residual dimension {}",
+                self.name,
+                self.operator.nrows(),
+                residual_dimension
+            ));
+        }
+        if self.operator.ncols() != self.prior.dimension() {
+            return Err(format!(
+                "uncertain input `{}` operator column count {} must match prior dimension {}",
+                self.name,
+                self.operator.ncols(),
+                self.prior.dimension()
+            ));
+        }
+        if let Some(collapsed) = &self.collapsed_precision {
+            if collapsed.nrows() != residual_dimension || collapsed.ncols() != residual_dimension {
+                return Err(format!(
+                    "uncertain input `{}` collapsed precision must be {}x{}, got {}x{}",
+                    self.name,
+                    residual_dimension,
+                    residual_dimension,
+                    collapsed.nrows(),
+                    collapsed.ncols()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearGaussianMeasurementSpec {
+    pub name: String,
+    pub operator: SparseTripletMatrix,
+    pub observations: Vec<f64>,
+    pub bias: Vec<f64>,
+    pub variance: f64,
+}
+
+impl LinearGaussianMeasurementSpec {
+    pub fn validate(&self, state_dimension: usize) -> Result<(), String> {
+        if self.operator.ncols() != state_dimension {
+            return Err(format!(
+                "measurement `{}` operator column count {} must match state dimension {}",
+                self.name,
+                self.operator.ncols(),
+                state_dimension
+            ));
+        }
+        if self.operator.nrows() != self.observations.len() {
+            return Err(format!(
+                "measurement `{}` observation length {} must match operator row count {}",
+                self.name,
+                self.observations.len(),
+                self.operator.nrows()
+            ));
+        }
+        if self.operator.nrows() != self.bias.len() {
+            return Err(format!(
+                "measurement `{}` bias length {} must match operator row count {}",
+                self.name,
+                self.bias.len(),
+                self.operator.nrows()
+            ));
+        }
+        if !self.variance.is_finite() || self.variance <= 0.0 {
+            return Err(format!(
+                "measurement `{}` variance must be finite and positive",
+                self.name
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrecisionWeightedGaussianMeasurementSpec {
+    pub name: String,
+    pub operator: SparseTripletMatrix,
+    pub observations: Vec<f64>,
+    pub bias: Vec<f64>,
+    pub precision: SparseTripletMatrix,
+}
+
+impl PrecisionWeightedGaussianMeasurementSpec {
+    pub fn validate(&self, state_dimension: usize) -> Result<(), String> {
+        if self.operator.ncols() != state_dimension {
+            return Err(format!(
+                "precision-weighted measurement `{}` operator column count {} must match state dimension {}",
+                self.name,
+                self.operator.ncols(),
+                state_dimension
+            ));
+        }
+        if self.operator.nrows() != self.observations.len() {
+            return Err(format!(
+                "precision-weighted measurement `{}` observation length {} must match operator row count {}",
+                self.name,
+                self.observations.len(),
+                self.operator.nrows()
+            ));
+        }
+        if self.operator.nrows() != self.bias.len() {
+            return Err(format!(
+                "precision-weighted measurement `{}` bias length {} must match operator row count {}",
+                self.name,
+                self.bias.len(),
+                self.operator.nrows()
+            ));
+        }
+        if self.precision.nrows() != self.operator.nrows()
+            || self.precision.ncols() != self.operator.nrows()
+        {
+            return Err(format!(
+                "precision-weighted measurement `{}` precision must be {}x{}, got {}x{}",
+                self.name,
+                self.operator.nrows(),
+                self.operator.nrows(),
+                self.precision.nrows(),
+                self.precision.ncols()
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpatialPriorSlice {
     pub mass: SparseTripletMatrix,
@@ -230,5 +403,14 @@ mod tests {
         let layout = StateLayout::identity(4);
         assert_eq!(layout.reduced_dimension(), 4);
         assert!(layout.fixed_dofs.is_empty());
+    }
+
+    #[test]
+    fn gaussian_prior_spec_rejects_mismatched_mean_length() {
+        let spec = GaussianPriorSpec {
+            mean: vec![1.0],
+            precision: SparseTripletMatrix::new(2, 2),
+        };
+        assert!(spec.validate().is_err());
     }
 }

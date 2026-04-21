@@ -63,6 +63,10 @@ fn torus_1form_pde_hodge_conditioning_builds_and_respects_branch_biases() {
             .ratio
             .iter()
             .all(|value| value.is_finite()));
+        assert!(branch
+            .conditioning
+            .posterior_deterministic_l2_error
+            .is_finite());
     }
 
     assert!(result.full.truth.iter().all(|value| value.is_finite()));
@@ -76,6 +80,7 @@ fn torus_1form_pde_hodge_conditioning_builds_and_respects_branch_biases() {
         .posterior_variance
         .iter()
         .all(|value| value.is_finite()));
+    assert!(result.full.posterior_deterministic_l2_error.is_finite());
 
     for branch in [&result.exact, &result.coexact, &result.harmonic] {
         assert!(
@@ -137,6 +142,9 @@ fn torus_1form_pde_hodge_conditioning_writes_expected_outputs() {
         out_dir.join("comparison_summary.txt").is_file(),
         "expected root comparison summary"
     );
+    let comparison_summary = fs::read_to_string(out_dir.join("comparison_summary.txt"))
+        .expect("comparison summary should be readable as text");
+    assert!(comparison_summary.contains("posterior_deterministic_l2_error="));
 
     for branch in ["full", "exact", "coexact", "harmonic"] {
         for relative in [
@@ -154,6 +162,10 @@ fn torus_1form_pde_hodge_conditioning_writes_expected_outputs() {
                 "expected output file for branch {branch}: {relative}"
             );
         }
+
+        let summary = fs::read_to_string(out_dir.join(branch).join("summary.txt"))
+            .expect("branch summary should be readable as text");
+        assert!(summary.contains("posterior_deterministic_l2_error="));
     }
 
     let _ = fs::remove_dir_all(&out_dir);

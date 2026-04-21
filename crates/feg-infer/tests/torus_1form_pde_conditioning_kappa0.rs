@@ -49,6 +49,7 @@ fn torus_1form_pde_conditioning_kappa0_is_harmonic_free_and_finite() {
         .ratio
         .iter()
         .all(|value| value.is_finite()));
+    assert!(result.posterior_deterministic_l2_error.is_finite());
     assert!(
         result
             .harmonic_coefficients_truth
@@ -104,6 +105,7 @@ fn torus_1form_pde_conditioning_kappa0_writes_expected_outputs() {
 
     let summary = fs::read_to_string(out_dir.join("summary.txt"))
         .expect("summary file should be readable as text");
+    assert!(summary.contains("posterior_deterministic_l2_error="));
     assert!(summary.contains("surface_vector_posterior_mean_magnitude_mean="));
     assert!(summary.contains("surface_vector_marginal_variance_ratio_mean="));
 

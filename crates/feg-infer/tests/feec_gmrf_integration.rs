@@ -32,7 +32,7 @@ fn feec_gmrf_pipeline_samples() {
         MaternConfig {
             kappa: 2.0,
             tau: 1.0,
-            mass_inverse: MaternMassInverse::RowSumLumped,
+            mass_inverse: MaternMassInverse::Nc1ProjectedSparseInverse,
         },
     );
 

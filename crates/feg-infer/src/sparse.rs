@@ -28,7 +28,10 @@ pub fn core_triplet_to_feec_csr(matrix: &SparseTripletMatrix) -> FeecCsr {
     FeecCsr::from(&coo)
 }
 
-pub fn reduce_vector_with_layout(layout: &StateLayout, full: &FeecVector) -> Result<FeecVector, String> {
+pub fn reduce_vector_with_layout(
+    layout: &StateLayout,
+    full: &FeecVector,
+) -> Result<FeecVector, String> {
     if full.len() != layout.full_dimension {
         return Err(format!(
             "full vector length {} does not match layout dimension {}",
@@ -42,7 +45,10 @@ pub fn reduce_vector_with_layout(layout: &StateLayout, full: &FeecVector) -> Res
     ))
 }
 
-pub fn lift_vector_with_layout(layout: &StateLayout, reduced: &FeecVector) -> Result<FeecVector, String> {
+pub fn lift_vector_with_layout(
+    layout: &StateLayout,
+    reduced: &FeecVector,
+) -> Result<FeecVector, String> {
     if reduced.len() != layout.reduced_dimension() {
         return Err(format!(
             "reduced vector length {} does not match layout reduced dimension {}",

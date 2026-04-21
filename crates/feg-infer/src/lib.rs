@@ -6,6 +6,7 @@ pub use sparse::{core_triplet_to_feec_csr, lift_vector_with_layout, reduce_vecto
 pub mod diagnostics;
 pub mod hodge_1form_conditioning;
 pub mod linear_conditioning;
+pub mod linear_pde;
 pub mod matern_0form;
 pub mod matern_1form;
 pub mod matern_2form;

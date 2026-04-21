@@ -52,10 +52,13 @@ pub fn build_spacetime_prior_from_slice(
     let q_init = core_triplet_to_feec_csr(&slice.initial_precision);
     let q_w = core_triplet_to_feec_csr(&slice.driving_noise_precision);
 
-    let mut diagonal_blocks = vec![FeecCsr::from(&common::linalg::nalgebra::CooMatrix::new(
-        slice.state_dimension(),
-        slice.state_dimension(),
-    )); config.slice_count()];
+    let mut diagonal_blocks = vec![
+        FeecCsr::from(&common::linalg::nalgebra::CooMatrix::new(
+            slice.state_dimension(),
+            slice.state_dimension(),
+        ));
+        config.slice_count()
+    ];
     let mut lower_blocks = Vec::with_capacity(config.slice_count().saturating_sub(1));
 
     diagonal_blocks[0] = add_sparse(&diagonal_blocks[0], &q_init);

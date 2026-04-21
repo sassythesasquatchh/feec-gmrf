@@ -26,8 +26,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.rng_seed,
     );
     println!(
-        "full: posterior_relative_residual_norm={} l2_error={} hd_error={}",
-        result.full.posterior_relative_residual_norm, result.full.l2_error, result.full.hd_error
+        "full: posterior_relative_residual_norm={} posterior_deterministic_l2_error={} l2_error={} hd_error={}",
+        result.full.posterior_relative_residual_norm,
+        result.full.posterior_deterministic_l2_error,
+        result.full.l2_error,
+        result.full.hd_error
     );
     print_branch_summary(&result.exact);
     print_branch_summary(&result.coexact);
@@ -140,9 +143,10 @@ fn print_usage() {
 fn print_branch_summary(branch: &Torus1FormPdeHodgeBranchResult) {
     println!("branch={}", branch.kind.as_str());
     println!(
-        "  latent_dimension={} posterior_relative_residual_norm={} l2_error={} hd_error={}",
+        "  latent_dimension={} posterior_relative_residual_norm={} posterior_deterministic_l2_error={} l2_error={} hd_error={}",
         branch.latent_dimension,
         branch.conditioning.posterior_relative_residual_norm,
+        branch.conditioning.posterior_deterministic_l2_error,
         branch.conditioning.l2_error,
         branch.conditioning.hd_error
     );

@@ -34,7 +34,7 @@ pub enum MaternMassInverse {
 
 impl Default for MaternMassInverse {
     fn default() -> Self {
-        Self::RowSumLumped
+        Self::Nc1ProjectedSparseInverse
     }
 }
 

@@ -27,8 +27,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("effective_range={}", result.effective_range);
     println!(
-        "l2_error={} hd_error={} posterior_relative_residual_norm={}",
-        result.l2_error, result.hd_error, result.posterior_relative_residual_norm
+        "posterior_deterministic_l2_error={} l2_error={} hd_error={} posterior_relative_residual_norm={}",
+        result.posterior_deterministic_l2_error,
+        result.l2_error,
+        result.hd_error,
+        result.posterior_relative_residual_norm
     );
     println!(
         "edge_variance_ratio_mean={} surface_trace_variance_ratio_mean={}",

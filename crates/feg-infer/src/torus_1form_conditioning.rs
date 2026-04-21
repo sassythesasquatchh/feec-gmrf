@@ -636,16 +636,20 @@ pub fn run_torus_1form_conditioning(
 
     let cell_count = cell_geometry.theta.len();
     let reconstructed_prior = split_component_estimates(
-        decomposition_to_estimates(
-            get_derived_decomposition(&harmonic_free_conditioning, "reconstructed", true)?,
-        ),
+        decomposition_to_estimates(get_derived_decomposition(
+            &harmonic_free_conditioning,
+            "reconstructed",
+            true,
+        )?),
         cell_count,
     )
     .map_err(invalid_data)?;
     let reconstructed_posterior = split_component_estimates(
-        decomposition_to_estimates(
-            get_derived_decomposition(&harmonic_free_conditioning, "reconstructed", false)?,
-        ),
+        decomposition_to_estimates(get_derived_decomposition(
+            &harmonic_free_conditioning,
+            "reconstructed",
+            false,
+        )?),
         cell_count,
     )
     .map_err(invalid_data)?;

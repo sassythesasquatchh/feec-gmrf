@@ -8,7 +8,9 @@ use feg_infer::prior::spacetime::{
 };
 use feg_infer::{core_triplet_to_feec_csr, lift_vector_with_layout, reduce_vector_with_layout};
 use formoniq::assemble;
-use formoniq::problems::spacetime_prior::{Hodge1MassInverse, Hodge1PriorConfig, ScalarPriorConfig};
+use formoniq::problems::spacetime_prior::{
+    Hodge1MassInverse, Hodge1PriorConfig, ScalarPriorConfig,
+};
 use gmrf_core::observation::apply_gaussian_observations;
 use gmrf_core::Gmrf;
 use manifold::gen::cartesian::CartesianMeshInfo;
@@ -22,12 +24,10 @@ fn mixed_bc_0form_spacetime_posterior_matches_backward_euler_recurrence() {
     let (topology, coords) = mesh.compute_coord_complex();
     let geometry = coords.to_edge_lengths(&topology);
 
-    let hard_dofs = assemble::boundary_simplices_where_barycenter(
-        &topology,
-        &coords,
-        0,
-        |p: CoordRef| p[1] == 1.0,
-    );
+    let hard_dofs =
+        assemble::boundary_simplices_where_barycenter(&topology, &coords, 0, |p: CoordRef| {
+            p[1] == 1.0
+        });
     let boundary = BoundarySpec::default().with_state_region(BoundaryRegionSpec::new(
         "top-dirichlet",
         hard_dofs.clone(),
@@ -56,8 +56,8 @@ fn mixed_bc_0form_spacetime_posterior_matches_backward_euler_recurrence() {
 
     let initial_field = DiffFormClosure::scalar(|p| p[1] * (1.0 - p[1]), 2);
     let initial_full = cochain_projection(&initial_field, &topology, &coords, None);
-    let initial_reduced =
-        reduce_vector_with_layout(&prior.slice.layout, initial_full.coeffs()).expect("layout reduction");
+    let initial_reduced = reduce_vector_with_layout(&prior.slice.layout, initial_full.coeffs())
+        .expect("layout reduction");
 
     let step_solver = |rhs: &FeecVector| {
         let precision = feg_infer::matern_0form::feec_csr_to_gmrf(&step_matrix);
@@ -182,7 +182,7 @@ fn mixed_bc_1form_soft_constraints_approach_hard_boundary_values() {
         Hodge1PriorConfig {
             kappa: 1.0,
             tau: 1.0,
-            mass_inverse: Hodge1MassInverse::RowSumLumped,
+            mass_inverse: Hodge1MassInverse::Nc1ProjectedSparseInverse,
         },
         &time,
     )
@@ -194,7 +194,7 @@ fn mixed_bc_1form_soft_constraints_approach_hard_boundary_values() {
         Hodge1PriorConfig {
             kappa: 1.0,
             tau: 1.0,
-            mass_inverse: Hodge1MassInverse::RowSumLumped,
+            mass_inverse: Hodge1MassInverse::Nc1ProjectedSparseInverse,
         },
         &time,
     )
@@ -209,18 +209,8 @@ fn mixed_bc_1form_soft_constraints_approach_hard_boundary_values() {
     let soft_step = add_sparse(&soft_mass, &scale_matrix(&soft_drift, 0.1));
     let soft_dim = soft_prior.slice.state_dimension();
 
-    let hard_mean = posterior_mean_with_zero_dynamics(
-        &hard_prior,
-        &hard_step,
-        hard_dim,
-        false,
-    );
-    let soft_mean = posterior_mean_with_zero_dynamics(
-        &soft_prior,
-        &soft_step,
-        soft_dim,
-        true,
-    );
+    let hard_mean = posterior_mean_with_zero_dynamics(&hard_prior, &hard_step, hard_dim, false);
+    let soft_mean = posterior_mean_with_zero_dynamics(&soft_prior, &soft_step, soft_dim, true);
 
     let hard_last = FeecVector::from_vec(hard_mean[2 * hard_dim..3 * hard_dim].to_vec());
     let soft_last = FeecVector::from_vec(soft_mean[2 * soft_dim..3 * soft_dim].to_vec());

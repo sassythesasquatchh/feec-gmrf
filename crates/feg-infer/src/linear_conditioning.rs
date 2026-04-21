@@ -99,12 +99,10 @@ impl LinearGaussianConditioningProblem {
             self.noise_variance,
         );
 
-        let harmonic_constraints = self
-            .harmonic_subspace
-            .as_ref()
-            .map_or_else(|| GmrfDenseMatrix::zeros(0, self.prior_precision.nrows()), |subspace| {
-                subspace.constraints.clone()
-            });
+        let harmonic_constraints = self.harmonic_subspace.as_ref().map_or_else(
+            || GmrfDenseMatrix::zeros(0, self.prior_precision.nrows()),
+            |subspace| subspace.constraints.clone(),
+        );
 
         let prior_factor = self.prior_precision.cholesky_sqrt_lower()?;
         let mut prior = Gmrf::from_mean_and_precision(
@@ -209,7 +207,9 @@ impl LinearGaussianConditioningProblem {
             }
             if let Some(projector) = &subspace.projector {
                 if projector.ncols != state_dim {
-                    return Err("harmonic projector column count must match latent dimension".into());
+                    return Err(
+                        "harmonic projector column count must match latent dimension".into(),
+                    );
                 }
             }
         }
@@ -240,13 +240,16 @@ impl PreparedLinearGaussianConditioningProblem {
         let mut posterior =
             Gmrf::from_information_and_precision(information.clone(), posterior_precision.clone())?;
         let posterior_mean = posterior.mean().clone();
-        let constrained_posterior_mean = self.harmonic_subspace.as_ref().map(|subspace| {
-            posterior
-                .constrained_mean(
+        let constrained_posterior_mean = self
+            .harmonic_subspace
+            .as_ref()
+            .map(|subspace| {
+                posterior.constrained_mean(
                     &subspace.constraints,
                     &GmrfVector::zeros(subspace.constraints.nrows()),
                 )
-        }).transpose()?;
+            })
+            .transpose()?;
 
         let posterior_observations = &self.observation_operator * &posterior_mean;
         let observation_residual = &posterior_observations - observations;
@@ -283,11 +286,9 @@ fn estimate_rbmc_decomposition(
         );
         let mut rng = rand::rngs::StdRng::seed_from_u64(batch_seed);
         let factor = precision.cholesky_sqrt_lower()?;
-        let mut gmrf = Gmrf::from_mean_and_precision(
-            GmrfVector::zeros(precision.nrows()),
-            precision.clone(),
-        )?
-        .with_precision_sqrt(factor);
+        let mut gmrf =
+            Gmrf::from_mean_and_precision(GmrfVector::zeros(precision.nrows()), precision.clone())?
+                .with_precision_sqrt(factor);
         let raw_unconstrained =
             rbmc_unconstrained_variances_batch(&mut gmrf, operator, batch_size, &mut rng)?;
         let stabilized_unconstrained = stabilize_positive_variances(&raw_unconstrained);
@@ -354,11 +355,9 @@ fn transformed_constraint_correction_diag(
     }
 
     let factor = precision.cholesky_sqrt_lower()?;
-    let mut gmrf = Gmrf::from_mean_and_precision(
-        GmrfVector::zeros(precision.nrows()),
-        precision.clone(),
-    )?
-    .with_precision_sqrt(factor);
+    let mut gmrf =
+        Gmrf::from_mean_and_precision(GmrfVector::zeros(precision.nrows()), precision.clone())?
+            .with_precision_sqrt(factor);
     let covariance_times_constraint_t = covariance_times_constraint_t(&mut gmrf, constraints)?;
     let schur = schur_complement(constraints, &covariance_times_constraint_t);
     let schur_inverse = invert_spd_dense(&schur)?;
@@ -398,7 +397,11 @@ fn covariance_times_constraint_t(
         columns.push(solved);
     }
 
-    Ok(GmrfDenseMatrix::from_fn(state_dim, constraint_dim, |i, j| columns[j][i]))
+    Ok(GmrfDenseMatrix::from_fn(
+        state_dim,
+        constraint_dim,
+        |i, j| columns[j][i],
+    ))
 }
 
 fn dense_row_as_vector(matrix: &GmrfDenseMatrix, row: usize) -> GmrfVector {
@@ -510,10 +513,7 @@ fn stabilize_positive_variances(variances: &GmrfVector) -> GmrfVector {
     )
 }
 
-fn stabilize_constrained_variances(
-    unconstrained: &GmrfVector,
-    removed: &GmrfVector,
-) -> GmrfVector {
+fn stabilize_constrained_variances(unconstrained: &GmrfVector, removed: &GmrfVector) -> GmrfVector {
     let positive_sum = unconstrained
         .iter()
         .copied()
@@ -712,14 +712,20 @@ mod tests {
             .expect("second solve should succeed");
 
         assert_sparse_matrix_eq(&first.posterior_precision, &second.posterior_precision);
-        assert_eq!(first.prior_latent_variance.unconstrained_diag, second.prior_latent_variance.unconstrained_diag);
-        assert_eq!(first.posterior_latent_variance.constrained_diag, second.posterior_latent_variance.constrained_diag);
-        assert_eq!(first.derived_prior_variances.len(), second.derived_prior_variances.len());
+        assert_eq!(
+            first.prior_latent_variance.unconstrained_diag,
+            second.prior_latent_variance.unconstrained_diag
+        );
+        assert_eq!(
+            first.posterior_latent_variance.constrained_diag,
+            second.posterior_latent_variance.constrained_diag
+        );
+        assert_eq!(
+            first.derived_prior_variances.len(),
+            second.derived_prior_variances.len()
+        );
         for (name, first_decomposition) in &first.derived_prior_variances {
-            assert_decomposition_eq(
-                first_decomposition,
-                &second.derived_prior_variances[name],
-            );
+            assert_decomposition_eq(first_decomposition, &second.derived_prior_variances[name]);
         }
         assert_eq!(
             first.derived_posterior_variances.len(),
@@ -767,6 +773,9 @@ mod tests {
             .expect("posterior transformed variances should succeed");
 
         assert_decomposition_eq(&result.derived_prior_variances["sum"], &expected_prior);
-        assert_decomposition_eq(&result.derived_posterior_variances["sum"], &expected_posterior);
+        assert_decomposition_eq(
+            &result.derived_posterior_variances["sum"],
+            &expected_posterior,
+        );
     }
 }

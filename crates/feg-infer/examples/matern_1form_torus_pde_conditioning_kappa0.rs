@@ -25,8 +25,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.rng_seed,
     );
     println!(
-        "posterior_relative_residual_norm={}",
-        result.posterior_relative_residual_norm
+        "posterior_relative_residual_norm={} posterior_deterministic_l2_error={}",
+        result.posterior_relative_residual_norm, result.posterior_deterministic_l2_error
     );
     println!(
         "edge_variance_ratio_mean={} surface_trace_variance_ratio_mean={}",

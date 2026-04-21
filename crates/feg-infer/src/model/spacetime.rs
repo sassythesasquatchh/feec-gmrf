@@ -25,7 +25,8 @@ impl SpacetimeLinearObservationBuilder {
         bias: &FeecVector,
         variance: f64,
     ) -> Result<(), String> {
-        let (reduced, reduced_bias) = restrict_columns_and_fold_fixed(full_block, bias, &self.layout)?;
+        let (reduced, reduced_bias) =
+            restrict_columns_and_fold_fixed(full_block, bias, &self.layout)?;
         self.inner
             .push_slice_block(
                 slice_index,
@@ -65,7 +66,8 @@ impl SpacetimeLinearObservationBuilder {
         bias: &FeecVector,
         variance: f64,
     ) -> Result<(), String> {
-        let (left_reduced, left_bias) = restrict_columns_and_fold_fixed(left_full, bias, &self.layout)?;
+        let (left_reduced, left_bias) =
+            restrict_columns_and_fold_fixed(left_full, bias, &self.layout)?;
         let (right_reduced, final_bias) =
             restrict_columns_and_fold_fixed(right_full, &left_bias, &self.layout)?;
         self.inner
@@ -101,7 +103,11 @@ impl SpacetimeLinearObservationBuilder {
             .map_err(|err| err.to_string())
     }
 
-    pub fn add_soft_boundary_constraints(&mut self, slice_count: usize, slice: &SpatialPriorSlice) -> Result<(), String> {
+    pub fn add_soft_boundary_constraints(
+        &mut self,
+        slice_count: usize,
+        slice: &SpatialPriorSlice,
+    ) -> Result<(), String> {
         for time_index in 0..slice_count {
             for constraint in &slice.soft_boundary_constraints {
                 self.push_soft_constraint(time_index, constraint)?;
@@ -189,13 +195,19 @@ mod tests {
         let layout = StateLayout::new(
             3,
             vec![0, 2],
-            vec![FixedDof { index: 1, value: 4.0 }],
+            vec![FixedDof {
+                index: 1,
+                value: 4.0,
+            }],
         );
 
         let (reduced, folded_bias) =
             restrict_columns_and_fold_fixed(&block, &bias, &layout).unwrap();
 
-        let mut rows = reduced.triplet_iter().map(|(r, c, v)| (r, c, *v)).collect::<Vec<_>>();
+        let mut rows = reduced
+            .triplet_iter()
+            .map(|(r, c, v)| (r, c, *v))
+            .collect::<Vec<_>>();
         rows.sort_by_key(|(r, c, _)| (*r, *c));
         assert_eq!(rows, vec![(0, 0, 2.0), (0, 1, 3.0)]);
         assert!((folded_bias[0] + 3.5).abs() < 1e-12);

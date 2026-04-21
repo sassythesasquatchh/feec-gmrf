@@ -23,9 +23,8 @@ use crate::torus_1form_pde_conditioning::{
     estimate_transformed_rbmc_variances, exact_transformed_variances, invalid_data,
     prepare_torus_1form_pde_problem, run_prepared_torus_1form_pde_conditioning,
     sparse_row_operator_apply_feec, sparse_row_operator_from_feec_dense,
-    sparse_row_operator_from_feec_sparse,
-    split_ambient_estimates, split_component_estimates, validate_config,
-    write_torus_1form_pde_conditioning_outputs, PreparedTorus1FormPdeProblem,
+    sparse_row_operator_from_feec_sparse, split_ambient_estimates, split_component_estimates,
+    validate_config, write_torus_1form_pde_conditioning_outputs, PreparedTorus1FormPdeProblem,
     SparseRowLinearOperator, Torus1FormAmbientVarianceEstimates, Torus1FormPdeConditioningConfig,
     Torus1FormPdeConditioningResult,
 };
@@ -343,9 +342,8 @@ fn run_branch(
     );
     let posterior = Gmrf::from_information_and_precision(information, posterior_precision.clone())?;
     let latent_posterior_mean = gmrf_vec_to_feec(posterior.mean());
-    let posterior_mean =
-        sparse_row_operator_apply_feec(ambient_operator, &latent_posterior_mean)
-            .map_err(invalid_data)?;
+    let posterior_mean = sparse_row_operator_apply_feec(ambient_operator, &latent_posterior_mean)
+        .map_err(invalid_data)?;
 
     let mut posterior_workspace = build_rbmc_workspace(&posterior_precision, &empty_constraints)?;
     let posterior_variance =
@@ -468,8 +466,7 @@ fn build_harmonic_free_projection_operator(
     let projector = FeecMatrix::identity(dim, dim)
         - &prepared.harmonic_basis_orthonormal
             * (prepared.harmonic_basis_orthonormal.transpose() * mass_dense);
-    sparse_row_operator_from_feec_dense(&projector, 0.0)
-        .map_err(|err| invalid_data(err).into())
+    sparse_row_operator_from_feec_dense(&projector, 0.0).map_err(|err| invalid_data(err).into())
 }
 
 fn write_branch_outputs(
@@ -555,6 +552,11 @@ fn write_result_summary(
         writer,
         "posterior_relative_residual_norm={}",
         result.posterior_relative_residual_norm
+    )?;
+    writeln!(
+        writer,
+        "posterior_deterministic_l2_error={}",
+        result.posterior_deterministic_l2_error
     )?;
     writeln!(writer, "l2_error={}", result.l2_error)?;
     writeln!(writer, "hd_error={}", result.hd_error)?;
